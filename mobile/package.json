@@ -1,6 +1,6 @@
 {
   "name": "ilo4-commander-mobile",
-  "version": "3.0.0",
+  "version": "3.0.4",
   "private": true,
   "description": "Android app for iLO4 Commander: a full-screen shell around your panel.",
   "scripts": {
