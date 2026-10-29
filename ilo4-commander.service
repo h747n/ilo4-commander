@@ -1,0 +1,22 @@
+[Unit]
+Description=iLO4 Commander - fan control and history for iLO 4 servers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@PREFIX@
+EnvironmentFile=@PREFIX@/.env
+ExecStart=@PREFIX@/venv/bin/python -m app
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=@PREFIX@/data
+
+[Install]
+WantedBy=multi-user.target

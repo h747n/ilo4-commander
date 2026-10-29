@@ -1,0 +1,24 @@
+# runtime state - servers (with iLO passwords), curves, history
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+venv/
+
+# mobile build output
+mobile/node_modules/
+mobile/android/
+mobile/dist/
+mobile/resources/
+mobile/www/icon.png
+
+# editors / OS
+.DS_Store
+*.swp

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0B0E13">
+<title>iLO Fans</title>
+<style>
+  :root{--bg:#0B0E13;--surface:#141922;--sunk:#10141B;--line:#242C39;--ink:#E8ECF3;--dim:#98A2B2;
+    --faint:#626D7D;--uid:#4C8DFF;--ok:#2FC08B;--crit:#F0555A;
+    --mono:ui-monospace,"Roboto Mono",Menlo,Consolas,monospace}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+    font:15px/1.5 system-ui,-apple-system,Roboto,"Segoe UI",sans-serif}
+  body{display:grid;place-items:center;padding:max(24px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom))}
+  .card{width:min(400px,100%);background:var(--surface);border:1px solid var(--line);border-radius:10px;
+    padding:24px;display:grid;gap:14px}
+  img{width:56px;height:56px}
+  h1{font-size:19px;margin:0}
+  p{margin:0;color:var(--dim);font-size:13.5px}
+  label{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);display:grid;gap:6px}
+  input{background:var(--sunk);border:1px solid var(--line);border-radius:7px;padding:12px;color:var(--ink);
+    font:16px var(--mono);width:100%}
+  input:focus{outline:none;border-color:var(--uid)}
+  button{border:1px solid rgba(76,141,255,.5);background:rgba(76,141,255,.18);color:#CFE0FF;border-radius:7px;
+    padding:12px;font:inherit;font-weight:600}
+  button.ghost{background:none;border-color:var(--line);color:var(--dim);font-weight:400}
+  .msg{font-size:13px;min-height:1.2em}
+  .msg.bad{color:var(--crit)} .msg.ok{color:var(--ok)}
+  .recent{display:flex;flex-wrap:wrap;gap:8px}
+  .recent span{font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:99px;padding:5px 10px;color:var(--dim)}
+  [hidden]{display:none!important}
+  .spin{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--uid);border-radius:50%;
+    animation:r 0.8s linear infinite;display:inline-block;vertical-align:-4px;margin-right:8px}
+  @keyframes r{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+  <div class="card" id="connecting" hidden>
+    <img src="icon.png" alt="">
+    <h1><span class="spin"></span>Connecting…</h1>
+    <p id="connUrl"></p>
+    <p class="msg bad" id="connErr"></p>
+    <button id="retry" hidden>Try again</button>
+    <button class="ghost" id="change">Change panel address</button>
+  </div>
+
+  <form class="card" id="setup" hidden>
+    <img src="icon.png" alt="">
+    <h1>Connect to your panel</h1>
+    <p>Enter the address of the iLO4 Commander panel, exactly as you open it in a browser. Your phone has to be on the same network or VPN.</p>
+    <label>Panel address
+      <input id="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false"
+             placeholder="http://192.168.1.50:8080">
+    </label>
+    <div class="recent" id="recent"></div>
+    <p class="msg" id="msg"></p>
+    <button type="submit" id="go">Connect</button>
+  </form>
+
+<script>
+  const $ = s => document.querySelector(s);
+  const get = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } };
+  const set = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+
+  function normalize(u) {
+    u = (u || "").trim().replace(/\/+$/, "");
+    if (!u) return "";
+    if (!/^https?:\/\//i.test(u)) u = "http://" + u;
+    return u;
+  }
+  async function reachable(u) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 7000);
+    try {
+      // no-cors: we only need to know something answered at that address.
+      await fetch(u + "/api/auth", { mode: "no-cors", cache: "no-store", signal: ctl.signal });
+      return true;
+    } catch { return false; } finally { clearTimeout(t); }
+  }
+  function remember(u) {
+    const list = JSON.parse(get("recent", "[]")).filter(x => x !== u);
+    list.unshift(u); set("recent", JSON.stringify(list.slice(0, 4))); set("panel", u);
+  }
+  function showSetup(prefill) {
+    $("#connecting").hidden = true; $("#setup").hidden = false;
+    $("#url").value = prefill || get("panel", "");
+    const box = $("#recent"); box.innerHTML = "";
+    JSON.parse(get("recent", "[]")).forEach(u => {
+      const s = document.createElement("span"); s.textContent = u.replace(/^https?:\/\//, "");
+      s.onclick = () => { $("#url").value = u; }; box.appendChild(s);
+    });
+  }
+  async function connect(u) {
+    $("#setup").hidden = true; $("#connecting").hidden = false;
+    $("#connUrl").textContent = u; $("#connErr").textContent = ""; $("#retry").hidden = true;
+    if (await reachable(u)) { location.replace(u + "/"); return; }
+    $("#connErr").textContent = "No answer from that address. Are you on the right Wi-Fi or VPN?";
+    $("#retry").hidden = false;
+  }
+  $("#retry").onclick = () => connect(get("panel", ""));
+  $("#change").onclick = () => showSetup();
+  $("#setup").onsubmit = async e => {
+    e.preventDefault();
+    const u = normalize($("#url").value);
+    if (!u) { $("#msg").textContent = "Enter the panel address."; $("#msg").className = "msg bad"; return; }
+    $("#go").disabled = true; $("#msg").textContent = "Checking…"; $("#msg").className = "msg";
+    const ok = await reachable(u);
+    $("#go").disabled = false;
+    if (!ok) { $("#msg").textContent = "No answer from that address."; $("#msg").className = "msg bad"; return; }
+    remember(u); location.replace(u + "/");
+  };
+
+  const saved = get("panel", "");
+  if (saved && !/[?&]change=1/.test(location.search)) connect(saved);
+  else showSetup();
+</script>
+</body>
+</html>

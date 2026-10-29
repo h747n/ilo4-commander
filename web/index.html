@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0B0E13">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="iLO Fans">
+<title>iLO4 Commander</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="style.css?v={{V}}">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <g id="i-gauge"><path d="M2 12a6 6 0 1 1 12 0"/><path d="M8 12 11 7"/></g>
+  <g id="i-therm"><path d="M9.5 9.3V3a1.5 1.5 0 0 0-3 0v6.3a3 3 0 1 0 3 0z"/></g>
+  <g id="i-fan"><circle cx="8" cy="8" r="1.4"/><path d="M8 6.6c0-2 .6-3.6 2.2-3.6 1.2 0 1.7 1.4.7 2.5L8 6.6z"/><path d="M9.2 8.7c1.7 1 2.7 2.3 1.9 3.7-.6 1-2 .7-2.3-.7l.4-3z"/><path d="M6.8 8.7c-1.7 1-2.7 2.3-1.9 3.7.6 1 2 .7 2.3-.7l-.4-3z"/></g>
+  <g id="i-sliders"><path d="M3 4h10M3 8h10M3 12h10"/><circle cx="6" cy="4" r="1.4"/><circle cx="10" cy="8" r="1.4"/><circle cx="5" cy="12" r="1.4"/></g>
+  <g id="i-clock"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.8v3.4l2.2 1.6"/></g>
+  <g id="i-gear"><circle cx="8" cy="8" r="2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1"/></g>
+  <g id="i-chev"><path d="M4.5 6.5 8 10l3.5-3.5"/></g>
+  <g id="i-server"><rect x="2.5" y="3" width="11" height="4" rx="1"/><rect x="2.5" y="9" width="11" height="4" rx="1"/><path d="M5 5h.01M5 11h.01"/></g>
+  <g id="i-refresh"><path d="M13 8a5 5 0 1 1-1.5-3.5"/><path d="M13 2.5v3h-3"/></g>
+</defs></svg>
+
+<!-- ===================================================== login gate -->
+<div id="login" class="gate" hidden>
+  <form class="gate-card" id="loginForm">
+    <img src="icons/icon.svg" alt="" width="44" height="44">
+    <span class="eyebrow">iLO4 Commander</span>
+    <h1>Sign in</h1>
+    <input type="password" id="loginPass" autocomplete="current-password" placeholder="Panel password">
+    <button type="submit" class="primary">Sign in</button>
+    <p class="gate-err" id="loginErr"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+
+  <!-- =================================================== top rail -->
+  <header class="rail">
+    <div class="switcher">
+      <button class="srv-btn" id="srvBtn" aria-haspopup="listbox" aria-expanded="false">
+        <span class="lamp" id="lampHealth"></span>
+        <span class="srv-txt">
+          <strong id="railName">—</strong>
+          <span class="sn" id="railModel">—</span>
+        </span>
+        <svg class="ic chev"><use href="#i-chev"/></svg>
+      </button>
+      <div class="srv-menu" id="srvMenu" hidden role="listbox"></div>
+    </div>
+
+    <div class="rail-stats">
+      <div class="stat"><b>Power</b><span id="railPower">—</span></div>
+      <div class="stat"><b>Hottest</b><span id="railTemp">—</span></div>
+      <div class="stat"><b>Draw</b><span id="railWatts">—</span></div>
+      <div class="stat"><b>Fans</b><span id="railMode">—</span></div>
+    </div>
+
+    <div class="rail-actions">
+      <span class="live-pill" id="livePill" hidden
+        data-tip="The live connection to the panel dropped. Numbers on screen are frozen until it reconnects.">reconnecting…</span>
+      <span class="links" id="links">
+        <i data-link="redfish" data-tip="Redfish over HTTPS — sensors and power state come from here."></i>
+        <i data-link="ssh" data-tip="SSH to the iLO CLI — every fan command goes this way."></i>
+      </span>
+      <button class="icon-btn" id="settingsBtn" aria-label="Servers and settings" data-tip="Servers and settings">
+        <svg class="ic"><use href="#i-gear"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="nav" id="nav">
+      <button data-tab="dash" class="on"><svg class="ic"><use href="#i-gauge"/></svg><span>Overview</span></button>
+      <button data-tab="sensors"><svg class="ic"><use href="#i-therm"/></svg><span>Sensors</span></button>
+      <button data-tab="history"><svg class="ic"><use href="#i-clock"/></svg><span>History</span></button>
+      <button data-tab="fans"><svg class="ic"><use href="#i-fan"/></svg><span>Fans</span></button>
+      <button data-tab="tuning"><svg class="ic"><use href="#i-sliders"/></svg><span>Tuning</span></button>
+    </nav>
+
+    <main class="main">
+
+      <!-- no servers yet -->
+      <section class="panel" id="emptyState" hidden>
+        <div class="card onboard">
+          <svg class="ic big"><use href="#i-server"/></svg>
+          <h2>Add your first server</h2>
+          <p class="note">One panel watches every iLO 4 on the network — no more one VM per server.
+            You'll need the iLO address and an account that can log in over SSH and HTTPS.</p>
+          <div class="row"><button class="primary" id="onboardAdd">Add a server</button></div>
+          <p class="hint">Moving from the old one-VM-per-server setup? Run <code>python -m app.migrate</code> — see the README.</p>
+        </div>
+      </section>
+
+      <!-- server-level warnings, shown above every tab -->
+      <div class="alert" id="linkAlert" hidden></div>
+
+      <!-- ============================================== OVERVIEW -->
+      <section data-panel="dash" class="panel on">
+        <div class="fleet" id="fleet" hidden></div>
+
+        <div class="banner" id="controlBanner">
+          <span class="banner-dot"></span>
+          <div><b id="bannerTitle">—</b><p id="bannerNote"></p></div>
+          <div class="banner-actions">
+            <button class="ghost" id="reapplyBtn"
+              data-tip="Send the current curve or manual limits to the fans again right now. The panel also does this by itself after a reboot.">
+              <svg class="ic sm"><use href="#i-refresh"/></svg> Re-send</button>
+            <button class="ghost danger" id="restoreBtn"
+              data-tip="Clears every manual limit, switches the curve off and restarts iLO's own fan loop.">Hand back to iLO</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Fan cage</h2>
+            <span class="info" tabindex="0"
+              data-tip="One column per fan, in chassis order. The filled area is the ceiling; the bright line is the speed the fan is really running at. Drag a column to set its ceiling by hand.">i</span>
+            <span class="spacer"></span>
+            <span class="floor-note" id="floorNote"></span>
+          </div>
+          <div class="cage" id="cage"></div>
+          <div class="cage-legend">
+            <span><i class="sw ceil"></i>ceiling</span>
+            <span id="legendNeedle"><i class="sw needle"></i>actual speed</span>
+            <span id="legendNoSpeed" hidden>this iLO doesn't report actual fan speed — columns show the ceiling in force</span>
+            <span><i class="sw auto"></i>left to iLO</span>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="card">
+            <div class="card-head">
+              <h2>Hottest sensors</h2>
+              <span class="info" tabindex="0"
+                data-tip="The bar shows how close each sensor is to its own caution threshold. Tap one to open its history.">i</span>
+            </div>
+            <div id="tempList" class="temps"><p class="empty">Waiting for the first reading…</p></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2>Last hour</h2>
+              <span class="info" tabindex="0"
+                data-tip="Hottest sensor in amber on the left axis, average fan speed in blue on the right.">i</span>
+            </div>
+            <svg id="trend" class="trend"></svg>
+            <div class="legend" id="trendLegend"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Activity</h2>
+            <span class="info" tabindex="0"
+              data-tip="Power changes, re-sent fan settings, watchdog trips and connection drops for this server. The same events appear as markers on the History chart.">i</span>
+          </div>
+          <div id="activity" class="activity"><p class="empty">Nothing yet.</p></div>
+        </div>
+      </section>
+
+      <!-- ============================================== SENSORS -->
+      <section data-panel="sensors" class="panel">
+        <div class="card">
+          <div class="card-head">
+            <h2>Thermal sensors</h2>
+            <span class="info" tabindex="0"
+              data-tip="Everything the chassis reports, grouped by where it sits. Marks on each gauge are that sensor's caution and critical thresholds. Tap a card to open its history.">i</span>
+            <span class="spacer"></span>
+            <div class="seg" id="sensorSort">
+              <button data-sort="group" class="on">By location</button>
+              <button data-sort="hot">Hottest first</button>
+            </div>
+          </div>
+          <div id="sensorGrid" class="sensor-groups"><p class="empty">Waiting for the first reading…</p></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Fans</h2>
+            <span class="info" tabindex="0"
+              data-tip="Percentage of full speed. iLO 4 does not report RPM over Redfish.">i</span>
+          </div>
+          <div id="sensorFans" class="sensor-grid"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Power</h2></div>
+          <div id="powerBox" class="kv"></div>
+        </div>
+      </section>
+
+      <!-- ============================================== HISTORY -->
+      <section data-panel="history" class="panel">
+        <div class="card">
+          <div class="hist-top">
+            <div class="seg" id="histKind">
+              <button data-kind="temp" class="on">Temperature</button>
+              <button data-kind="fan">Fan speed</button>
+              <button data-kind="power">Power</button>
+              <button data-kind="target" data-tip="What the automatic curve asked for, per profile.">Curve output</button>
+            </div>
+            <span class="spacer"></span>
+            <div class="seg" id="histRange">
+              <button data-range="1h">1h</button>
+              <button data-range="6h">6h</button>
+              <button data-range="24h" class="on">1d</button>
+              <button data-range="7d">1w</button>
+              <button data-range="30d">1m</button>
+              <button data-range="90d">3m</button>
+            </div>
+          </div>
+
+          <div class="hist-nav">
+            <button class="ghost" id="histPrev" aria-label="Earlier">‹</button>
+            <span class="hist-window" id="histWindow">—</span>
+            <button class="ghost" id="histNext" aria-label="Later">›</button>
+            <button class="ghost" id="histNow">Now</button>
+            <span class="spacer"></span>
+            <input type="datetime-local" id="histEnd" aria-label="Show the window ending at"
+              data-tip="Jump to a window ending at this date and time">
+
+            <label class="cbx"><input type="checkbox" id="histBand" checked> min/max band</label>
+            <label class="cbx"><input type="checkbox" id="histEvents" checked> events</label>
+            <button class="ghost" id="histCsv">Export CSV</button>
+          </div>
+
+          <div class="hist-chart-wrap">
+            <svg id="histChart" class="hist-chart"></svg>
+            <div class="hist-tip" id="histTip" hidden></div>
+          </div>
+
+          <div class="hist-stats" id="histStats"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Sensors to plot</h2>
+            <span class="info" tabindex="0"
+              data-tip="Tap to add or remove a line. Up to 24 at once.">i</span>
+            <span class="spacer"></span>
+            <input id="histFilter" placeholder="Filter…" class="filter">
+            <button class="ghost" id="histAll">All</button>
+            <button class="ghost" id="histNone">None</button>
+          </div>
+          <div id="histSeries" class="hist-picker"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Events in this window</h2>
+            <span class="info" tabindex="0"
+              data-tip="Kept for 180 days. Every time control goes back to iLO, the entry says which sensor caused it, its temperature and the limit it hit.">i</span>
+            <span class="spacer"></span>
+            <div class="seg" id="histEvFilter">
+              <button data-ev="all" class="on">All</button>
+              <button data-ev="handback">Handed to iLO</button>
+              <button data-ev="power">Power</button>
+              <button data-ev="link">Connection</button>
+              <button data-ev="reassert">Re-sent</button>
+            </div>
+          </div>
+          <div id="histEventList" class="activity"><p class="empty">No events.</p></div>
+          <p class="hint" id="histStorage"></p>
+        </div>
+      </section>
+
+      <!-- ============================================== FANS -->
+      <section data-panel="fans" class="panel">
+        <div class="card">
+          <div class="card-head">
+            <h2>Automatic curves</h2>
+            <span class="info" tabindex="0"
+              data-tip="Each curve has its own sensor and points, and every fan follows exactly one curve. The settings survive reboots: the panel re-sends them when the server comes back up.">i</span>
+            <span class="spacer"></span>
+            <span class="switch-label" id="curveState">off</span>
+            <label class="switch"><input type="checkbox" id="curveOn"><span></span></label>
+          </div>
+
+          <div class="prof-bar" id="profBar"></div>
+
+          <div class="row wrap curve-controls">
+            <label>Name</label>
+            <input id="profName" class="pname" placeholder="Curve name">
+            <label>Sensor</label>
+            <select id="curveSensor"></select>
+            <span class="spacer"></span>
+            <div class="seg" id="curvePresets">
+              <button data-preset="silent">Silent</button>
+              <button data-preset="balanced">Balanced</button>
+              <button data-preset="aggressive">Aggressive</button>
+            </div>
+            <button id="profDel" class="ghost danger">Delete curve</button>
+          </div>
+
+          <div class="row wrap assign-row">
+            <label>Drives fans</label>
+            <div class="fan-chips" id="assignChips"></div>
+          </div>
+
+          <div class="row wrap assign-row">
+            <label>Minimum fan speed</label>
+            <input id="minPwm" type="number" min="0" max="60" step="1"><span class="unit">%</span>
+            <button id="minPwmSave" class="ghost">Save</button>
+            <span class="info" tabindex="0"
+              data-tip="Nothing lower than this is ever sent to any fan on this server, whether by the curve, a preset or by hand. The dashed line on the chart shows it. Too low and a fan can stall, which makes iLO report a fan fault and spin everything to full speed.">i</span>
+            <span class="hint" id="minPwmHint" style="margin:0"></span>
+          </div>
+
+          <div class="curve-live" id="curveLive"></div>
+          <svg id="curveEditor" class="curve-editor"></svg>
+
+          <div class="pt-editor" id="ptEditor" hidden>
+            <span class="pt-label">Point</span>
+            <input type="number" id="ptTemp" min="0" max="120"><span class="unit">°C</span>
+            <input type="number" id="ptPct" min="0" max="100"><span class="unit">%</span>
+            <button id="ptDel" class="ghost danger">Delete</button>
+            <span class="spacer"></span>
+            <button id="ptAdd" class="ghost">Add point</button>
+          </div>
+          <p class="hint" id="curveHint">Drag a point to reshape the curve, or tap one to type exact numbers. Double-click (double-tap) empty space to add a point.</p>
+
+          <details class="adv">
+            <summary>Response settings</summary>
+            <div class="adv-grid">
+              <label>Hysteresis <span class="info" tabindex="0" data-tip="The temperature has to move at least this much before a small speed change is made. Stops the fans hunting up and down around one temperature.">i</span></label>
+              <span><input id="curveHyst" type="number" min="0" max="10" step="0.5"> <span class="unit">°C</span></span>
+              <label>Ramp up <span class="info" tabindex="0" data-tip="Largest increase per poll. Higher reacts faster to heat.">i</span></label>
+              <span><input id="curveUp" type="number" min="1" max="100"> <span class="unit">% / poll</span></span>
+              <label>Ramp down <span class="info" tabindex="0" data-tip="Largest decrease per poll. Keep this low so the fans settle down gently after a load spike.">i</span></label>
+              <span><input id="curveDown" type="number" min="1" max="100"> <span class="unit">% / poll</span></span>
+              <label>Resume after watchdog <span class="info" tabindex="0" data-tip="When the watchdog hands the fans back to iLO, pick the curve up again by itself once every sensor has cooled down.">i</span></label>
+              <span><label class="switch"><input type="checkbox" id="curveResume"><span></span></label></span>
+            </div>
+            <div class="row"><span class="spacer"></span><button id="curveSave" class="primary">Save</button></div>
+          </details>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Manual control</h2>
+            <span class="info" tabindex="0"
+              data-tip="Writes straight to the PWM registers. While the curve is on it overwrites these on its next poll. Manual limits are also re-sent after a reboot.">i</span>
+          </div>
+
+          <div class="modes" id="modeBox">
+            <button data-mode="max" class="on">
+              <b>Ceiling</b><i>The fastest a fan may run. iLO can still slow down below it. Safest.</i>
+            </button>
+            <button data-mode="min">
+              <b>Floor</b><i>The slowest a fan may run, so it doesn't stall under light load.</i>
+            </button>
+            <button data-mode="lock">
+              <b>Lock</b><i>Fixes the speed outright. iLO can no longer ramp up. Risky.</i>
+            </button>
+          </div>
+
+          <div class="row all-row">
+            <label>All fans</label>
+            <input type="range" id="allSlider" min="0" max="100" value="30">
+            <output id="allOut">30%</output>
+            <button id="allApply" class="primary">Apply</button>
+          </div>
+
+          <div id="fanRows" class="fan-rows"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Presets</h2>
+            <span class="info" tabindex="0" data-tip="Saved manual settings for this server. Tap to apply, × to delete.">i</span>
+          </div>
+          <div id="presetList" class="chips"></div>
+          <div class="row">
+            <input id="presetName" placeholder="Name for the current settings">
+            <button id="presetSave">Save current</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================== TUNING -->
+      <section data-panel="tuning" class="panel">
+        <div class="banner warn">
+          <span class="banner-dot"></span>
+          <div>
+            <b>These commands write straight to iLO's fan controller</b>
+            <p>Nothing checks the values you type. Read the guide for each section first, and keep the Overview open on a second screen while you experiment.</p>
+          </div>
+        </div>
+
+        <div class="card fa" dir="rtl" lang="fa">
+          <div class="card-head"><h2>راهنمای شروع — روال امن کم کردن صدای فن</h2></div>
+          <ol class="steps">
+            <li><b>اول فقط نگاه کن.</b> یک روز سرور را با حالت پیش‌فرض iLO کار بده و در تب History ببین دمای CPU و Inlet در حالت عادی و زیر بار به چند می‌رسد. این عددها مبنای کارت هستند.</li>
+            <li><b>از منحنی Balanced شروع کن.</b> در تب Fans منحنی را روشن کن و حسگر را «Hottest CPU» بگذار. این کار iLO را حذف نمی‌کند؛ فقط برای فن‌ها «سقف» تعیین می‌کند.</li>
+            <li><b>زیر بار تست کن.</b> سرور را ۱۵ تا ۲۰ دقیقه زیر بار کامل ببر (مثلاً <code>stress-ng --cpu 0</code>) و دماها را نگاه کن. CPU باید زیر ۷۵ تا ۸۰ درجه بماند و هیچ حسگری به آستانه Caution نزدیک نشود.</li>
+            <li><b>کم‌کم پایین بیا.</b> هر بار فقط نقطه‌های پایین منحنی را ۲ تا ۴ درصد کم کن و دوباره تست کن. از نقطه‌های بالای منحنی (۷۵ درجه به بالا) دست نزن؛ آن‌ها بیمه‌ی تو هستند.</li>
+            <li><b>Watchdog را خاموش نکن.</b> اگر حسگری به <i>Caution منهای حاشیه</i> برسد، پنل فوراً فن‌ها را به iLO برمی‌گرداند و بعد از خنک شدن، خودش دوباره منحنی را فعال می‌کند. اتفاق‌ها در کارت Activity ثبت می‌شوند.</li>
+            <li><b>فقط وقتی لازم شد سراغ این تب بیا.</b> بیشتر سرورها با همان منحنی تب Fans کاملاً ساکت می‌شوند. دستورهای این صفحه برای مواردی است که یک حسگر خاص (مثلاً کارت شبکه یا PCIe) بی‌دلیل فن‌ها را بالا نگه می‌دارد.</li>
+          </ol>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Inspect</h2>
+            <span class="info" tabindex="0" data-tip="Read-only. Safe to press any time.">i</span>
+          </div>
+          <div class="row wrap">
+            <button data-info-cmd="">fan info</button>
+            <button data-info-cmd="g">Groups</button>
+            <button data-info-cmd="t">Temps</button>
+            <button data-info-cmd="p">PWM</button>
+            <button data-info-cmd="h">Tach</button>
+            <button data-info-cmd="a">Algorithms</button>
+            <button id="dumpBtn">Register dump</button>
+          </div>
+          <details class="guide fa" dir="rtl" lang="fa">
+            <summary>خروجی‌ها را چطور بخوانم؟</summary>
+            <ul>
+              <li><b>Groups (<code>fan info g</code>)</b> مهم‌ترین خروجی است. هر «گروه» یک دسته فن است و ستون‌هایش نشان می‌دهند <i>کدام حسگر</i> الان آن گروه را بالا برده. اگر می‌بینی مثلاً حسگر شماره ۳۰ (معمولاً PCIe یا کارت شبکه‌ی غیر HP) گروه را روی ۶۰٪ نگه داشته، مشکل پیدا شد.</li>
+              <li><b>Temps (<code>fan info t</code>)</b> فهرست حسگرهای داخلی کنترلر با شماره‌شان است. این شماره همان <code>#</code> بخش «Temperature sensors» پایین صفحه است و با اسم‌های Redfish (مثل 02-CPU 1) یکی نیست؛ از روی اسم و دمای فعلی تطبیقشان بده.</li>
+              <li><b>PWM (<code>fan info p</code>)</b> مقدار خام هر کانال فن است، از ۰ تا ۲۵۵. یعنی ۱۲۸ تقریباً ۵۰٪ است. ستون‌های min و max همان کف و سقفی هستند که این پنل تنظیم می‌کند.</li>
+              <li><b>Tach</b> سرعت واقعی هر فن است. اگر عدد یک فن زیر حد مجازش برود، iLO آن فن را خراب فرض می‌کند و همه‌ی فن‌ها را تند می‌کند.</li>
+              <li><b>Algorithms</b> نشان می‌دهد هر گروه با PID کار می‌کند یا با جدول ثابت. فقط برای کنجکاوی است.</li>
+            </ul>
+          </details>
+        </div>
+
+        <div class="grid2">
+          <div class="card">
+            <div class="card-head">
+              <h2>Temperature sensors</h2>
+              <span class="info" tabindex="0" data-tip="Per-sensor settings inside iLO's controller. Index # comes from `fan info t`.">i</span>
+            </div>
+            <div class="row wrap">
+              <input id="tIdx" type="number" min="0" value="0" class="num" placeholder="#">
+              <select id="tKey">
+                <option value="off">off — ignore this sensor</option>
+                <option value="on">on — use it again</option>
+                <option value="adj">adj — offset (°C)</option>
+                <option value="hyst">hyst — hysteresis</option>
+                <option value="caut">caut — caution threshold</option>
+                <option value="crit">crit — critical threshold</option>
+                <option value="set">set — fake reading</option>
+                <option value="unset">unset — clear fake</option>
+              </select>
+              <input id="tVal" placeholder="value" class="val">
+              <button id="tApply">Apply</button>
+            </div>
+            <details class="guide fa" dir="rtl" lang="fa">
+              <summary>راهنمای این بخش</summary>
+              <ul>
+                <li><b>off</b>: کنترلر این حسگر را نادیده می‌گیرد. رایج‌ترین کاربردش وقتی است که یک کارت PCIe غیر HP دمایی گزارش نمی‌دهد و iLO برای احتیاط فن‌ها را بالا نگه می‌دارد. <span class="warn-inline">فقط حسگری را خاموش کن که مطمئنی گرمای واقعی را نشان نمی‌دهد. CPU، DIMM و منبع تغذیه را هیچ‌وقت خاموش نکن.</span></li>
+                <li><b>adj</b>: به دمای خوانده‌شده عدد اضافه یا کم می‌کند، مثلاً <code>-5</code>. از off امن‌تر است، چون حسگر هنوز کار می‌کند ولی دیرتر واکنش نشان می‌دهد.</li>
+                <li><b>set</b> و <b>unset</b>: یک دمای جعلی به حسگر می‌دهد تا ببینی کنترلر چه واکنشی نشان می‌دهد، بدون اینکه چیزی واقعاً داغ شود. حتماً بعدش <code>unset</code> بزن.</li>
+                <li><b>caut / crit / hyst</b>: آستانه‌های خود iLO را عوض می‌کنند. توصیه نمی‌شود؛ Watchdog این پنل هم بر اساس همین آستانه‌ها کار می‌کند.</li>
+                <li>همه‌ی این تغییرها با ریست شدن iLO یا قطع برق پاک می‌شوند. اگر می‌خواهی دائمی باشند، بعد از تست در کارت <i>Raw command</i> پایین صفحه یادداشتشان کن.</li>
+              </ul>
+            </details>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>PID loop</h2>
+              <span class="info" tabindex="0" data-tip="The gains iLO uses to drive a fan group toward a setpoint. Index # is the algorithm number from `fan info a`.">i</span>
+            </div>
+            <div class="row wrap">
+              <input id="pidIdx" type="number" min="0" value="0" class="num" placeholder="#">
+              <select id="pidKey">
+                <option value="sp">sp — setpoint</option>
+                <option value="lo">lo — output low</option>
+                <option value="hi">hi — output high</option>
+                <option value="p">p — proportional</option>
+                <option value="i">i — integral</option>
+                <option value="d">d — derivative</option>
+                <option value="imin">imin — windup min</option>
+                <option value="imax">imax — windup max</option>
+              </select>
+              <input id="pidVal" placeholder="value" class="val">
+              <button id="pidApply">Apply</button>
+            </div>
+            <details class="guide fa" dir="rtl" lang="fa">
+              <summary>راهنمای این بخش</summary>
+              <ul>
+                <li><b>sp (Setpoint)</b>: دمایی که iLO می‌خواهد حسگر را رویش نگه دارد. بالاتر بردنش یعنی فن کندتر و دمای بیشتر. قابل‌فهم‌ترین تنظیم این بخش است.</li>
+                <li><b>lo / hi</b>: کمترین و بیشترین خروجی این حلقه. با کم کردن <b>lo</b> فن‌ها در حالت بیکاری آرام‌تر می‌شوند.</li>
+                <li><b>p / i / d</b>: ضریب‌های کنترلر. اگر مطمئن نیستی، دست نزن. p بزرگ‌تر یعنی واکنش تندتر ولی نوسان بیشتر، i خطای ماندگار را کم می‌کند و d جلوی پریدن ناگهانی را می‌گیرد.</li>
+                <li><b>imin / imax</b>: حد انباشت بخش انتگرالی (anti-windup). تقریباً هیچ‌وقت لازم نیست.</li>
+                <li>فرمت عدد باید همانی باشد که خروجی <code>fan info a</code> نشان می‌دهد. اگر فرمت اشتباه باشد، فرمان بی‌صدا نادیده گرفته می‌شود.</li>
+                <li>برای بیشتر کاربران منحنی تب Fans همان نتیجه را با ریسک خیلی کمتر می‌دهد. منحنی فقط سقف تعیین می‌کند و iLO همچنان می‌تواند فن‌ها را کند کند.</li>
+              </ul>
+            </details>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Tachometers</h2>
+              <span class="info" tabindex="0" data-tip="Per-fan speed sensors. Index # comes from `fan info h`.">i</span>
+            </div>
+            <div class="row wrap">
+              <input id="hIdx" type="number" min="0" value="0" class="num" placeholder="#">
+              <select id="hKey">
+                <option value="min">min — lowest acceptable reading</option>
+                <option value="hyst">hyst — hysteresis</option>
+                <option value="on">on</option>
+                <option value="off">off</option>
+              </select>
+              <input id="hVal" placeholder="value" class="val">
+              <button id="hApply">Apply</button>
+            </div>
+            <details class="guide fa" dir="rtl" lang="fa">
+              <summary>راهنمای این بخش</summary>
+              <ul>
+                <li>وقتی فن‌ها را خیلی کند کنی، سرعت واقعی‌شان ممکن است زیر <b>min</b> برود. آن‌وقت iLO فن را «خراب» اعلام می‌کند، خطای Fan Failure ثبت می‌شود و همه‌ی فن‌ها با سرعت کامل می‌چرخند.</li>
+                <li>اگر بعد از کم کردن فن‌ها چنین چیزی دیدی، راه درست بالا بردن کف (Floor) در تب Fans است، نه پایین آوردن min.</li>
+                <li><b>off</b> نظارت iLO روی آن فن را کامل برمی‌دارد. خطرناک است، چون اگر فن واقعاً از کار بیفتد دیگر کسی خبردار نمی‌شود.</li>
+              </ul>
+            </details>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Controller</h2>
+              <span class="info" tabindex="0" data-tip="Starts and stops iLO's whole fan loop.">i</span>
+            </div>
+            <div class="row wrap">
+              <button data-fang="">Status</button>
+              <button data-fang="start">Start loop</button>
+              <button data-fang="stop" class="danger">Stop loop</button>
+            </div>
+            <div class="row wrap">
+              <label>Sample rate</label>
+              <input id="rateMs" type="number" value="3000" min="250" max="60000"><span class="unit">ms</span>
+              <button id="rateApply">Apply</button>
+            </div>
+            <details class="guide fa" dir="rtl" lang="fa">
+              <summary>راهنمای این بخش</summary>
+              <ul>
+                <li><b>Stop loop</b> حلقه‌ی کنترل iLO را کامل متوقف می‌کند. فن‌ها روی آخرین سرعتشان می‌مانند و به هیچ دمایی واکنش نشان نمی‌دهند. <span class="warn-inline">فقط برای چند ثانیه و هنگام عیب‌یابی استفاده کن و بعدش حتماً Start loop بزن.</span> دکمه‌ی «Hand back to iLO» هم خودش Start را می‌فرستد.</li>
+                <li><b>Sample rate</b> فاصله‌ی نمونه‌برداری حلقه‌ی داخلی iLO است (پیش‌فرض ۳۰۰۰ میلی‌ثانیه). کم کردنش واکنش را سریع‌تر می‌کند ولی پردازنده‌ی iLO را بیشتر درگیر می‌کند. معمولاً نیازی به تغییرش نیست.</li>
+              </ul>
+            </details>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Raw fan command</h2>
+            <span class="info" tabindex="0" data-tip="Any `fan` subcommand this page doesn't wrap. The `fan ` prefix is added for you.">i</span>
+          </div>
+          <div class="chips" id="rawExamples">
+            <span class="chip" data-raw="fan info g">fan info g</span>
+            <span class="chip" data-raw="fan p 0 max 100">fan p 0 max 100</span>
+            <span class="chip" data-raw="fan p 0 min 40">fan p 0 min 40</span>
+            <span class="chip" data-raw="fan t 30 off">fan t 30 off</span>
+            <span class="chip" data-raw="fan t 30 adj -5">fan t 30 adj -5</span>
+          </div>
+          <div class="row">
+            <input id="rawFanCmd" placeholder="fan p 3 max 100" spellcheck="false" autocapitalize="off">
+            <button id="rawFanRun">Run</button>
+          </div>
+          <pre class="out" id="tuningOut">Output of the commands above appears here.</pre>
+          <details class="guide fa" dir="rtl" lang="fa">
+            <summary>دستورهای پرکاربرد</summary>
+            <ul>
+              <li><code>fan p &lt;n&gt; max &lt;0-255&gt;</code>: سقف کانال n. منحنی دقیقاً همین را می‌فرستد. ۲۵۵ یعنی بدون سقف.</li>
+              <li><code>fan p &lt;n&gt; min &lt;0-255&gt;</code>: کف کانال n.</li>
+              <li><code>fan p &lt;n&gt; lock &lt;0-255&gt;</code> و <code>fan p &lt;n&gt; unlock</code>: قفل کردن سرعت و آزاد کردنش.</li>
+              <li><code>fan t &lt;n&gt; off</code> و <code>fan t &lt;n&gt; adj -5</code>: نادیده گرفتن یک حسگر یا کم کردن دمایش.</li>
+              <li>یادت باشد مقدارهای <b>p</b> از ۰ تا ۲۵۵ هستند، نه درصد. برای درصد، عدد را در ۲٫۵۵ ضرب کن.</li>
+              <li>دستورهایی که اینجا اجرا می‌کنی بعد از ریبوت پاک می‌شوند. فقط منحنی و تنظیمات دستی تب Fans را پنل خودش دوباره اعمال می‌کند.</li>
+            </ul>
+          </details>
+        </div>
+
+        <div class="card fa" dir="rtl" lang="fa">
+          <div class="card-head"><h2>سؤال‌های رایج و عیب‌یابی</h2></div>
+          <details class="guide open-first"><summary>بعد از ریبوت سرور، فن‌ها چند دقیقه تند می‌چرخند. طبیعی است؟</summary>
+            <p>بله. در زمان POST خود iLO فن‌ها را با سرعت بالا می‌چرخاند. پنل تغییر وضعیت برق و پایان POST را تشخیص می‌دهد و تنظیمات را خودکار دوباره می‌فرستد: یک بار در لحظه‌ی بالا آمدن، یک بار وقتی POST تمام شد و دو بار دیگر یک و سه دقیقه بعد. در کارت Activity می‌بینی کی این اتفاق افتاده. اگر عجله داری، دکمه‌ی <b>Re-send</b> در Overview را بزن.</p></details>
+          <details class="guide"><summary>منحنی را چطور طراحی کنم؟</summary>
+            <p>محور افقی دمای حسگر انتخاب‌شده و محور عمودی سقف سرعت فن است. سه ناحیه را در نظر بگیر:</p>
+            <ul>
+              <li><b>بیکاری (۳۵ تا ۵۰ درجه):</b> کمترین درصدی که فن‌ها هنوز با آن به‌خوبی می‌چرخند. روی بیشتر Gen8 و Gen9 ها بین ۱۰ تا ۲۰ درصد است.</li>
+              <li><b>بار معمول (۵۰ تا ۷۰ درجه):</b> یک شیب ملایم. همین‌جا بیشترین تأثیر را روی صدا داری.</li>
+              <li><b>ناحیه‌ی امن (۷۵ درجه به بالا):</b> شیب تند تا ۱۰۰٪. این بخش را هیچ‌وقت صاف نکن.</li>
+            </ul>
+            <p>برای فن‌های جلو که هوای دیسک‌ها را تأمین می‌کنند، می‌توانی یک منحنی جدا بسازی که حسگر «HD Max» یا «Inlet» را دنبال کند.</p></details>
+          <details class="guide"><summary>Hysteresis و Ramp را چند بگذارم؟</summary>
+            <p><b>Hysteresis</b> بین ۲ تا ۳ درجه جلوی بالا و پایین رفتن مداوم فن‌ها را وقتی دما حول یک عدد نوسان می‌کند می‌گیرد. <b>Ramp up</b> را بزرگ نگه دار (۱۰ تا ۲۰) تا در برابر گرما سریع واکنش نشان دهد. <b>Ramp down</b> را کوچک بگذار (۳ تا ۵) تا بعد از یک بار کوتاه، فن‌ها آرام پایین بیایند و صدا مدام عوض نشود. فاصله‌ی نمونه‌برداری را در تنظیمات هر سرور تعیین می‌کنی (پیش‌فرض ۱۰ ثانیه).</p></details>
+          <details class="guide"><summary>Ceiling، Floor و Lock چه فرقی دارند؟</summary>
+            <p><b>Ceiling</b> یا سقف: iLO همچنان خودش تصمیم می‌گیرد، فقط نمی‌تواند از این عدد بالاتر برود. امن‌ترین حالت است و منحنی هم از همین استفاده می‌کند. <b>Floor</b> یا کف: فن کمتر از این نمی‌چرخد. <b>Lock</b>: سرعت کاملاً ثابت می‌شود و iLO هیچ اختیاری ندارد، حتی اگر CPU داغ شود. فقط Watchdog این پنل نجاتت می‌دهد.</p></details>
+          <details class="guide"><summary>Watchdog دقیقاً چه کار می‌کند؟</summary>
+            <p>هر بار که دما خوانده می‌شود، اگر حسگری به <i>آستانه‌ی Caution خودش منهای حاشیه</i> برسد (حاشیه در تنظیمات هر سرور تعیین می‌شود و پیش‌فرض ۵ درجه است)، همه‌ی محدودیت‌ها برداشته می‌شوند و کنترل به iLO برمی‌گردد. اگر «Resume after watchdog» روشن باشد، وقتی همه‌ی حسگرها حداقل ۵ درجه زیر آن نقطه بیایند و دو دقیقه گذشته باشد، منحنی خودش دوباره فعال می‌شود.</p></details>
+          <details class="guide"><summary>اتصال Redfish مدام قطع و وصل می‌شود</summary>
+            <p>iLO 4 پردازنده‌ی ضعیفی دارد. در این نسخه فقط یک سرویس با iLO حرف می‌زند، یک بار لاگین می‌کند و session را نگه می‌دارد. پس باز کردن چند تب یا اپ موبایل دیگر باری روی iLO نمی‌گذارد. اگر هنوز قطعی می‌بینی:</p>
+            <ul>
+              <li>در تنظیمات سرور، Poll interval را به ۱۵ یا ۲۰ ثانیه برسان.</li>
+              <li>ابزارهای دیگری را که هم‌زمان از iLO می‌خوانند (Prometheus exporter، Home Assistant، اسکریپت‌های قدیمی و VM های قدیمی همین پنل) خاموش کن.</li>
+              <li>از داخل iLO گزینه‌ی <i>Reset iLO</i> را بزن. iLO 4 بعد از چند ماه روشن ماندن کند می‌شود.</li>
+              <li>یک یا دو خطای پشت سر هم وضعیت را فقط «degraded» می‌کند و داده‌ی قبلی نمایش داده می‌شود. فقط بعد از سه خطای پشت سر هم وضعیت «down» می‌شود.</li>
+            </ul></details>
+          <details class="guide"><summary>پیغام «unpatched» یا «fan command doesn't work»</summary>
+            <p>یعنی SSH وصل است ولی فرمان <code>fan</code> وجود ندارد، پس فریمور iLO پچ نشده. حسگرها و History کار می‌کنند ولی کنترل فن ممکن نیست. فریمور iLO 4 نسخه‌ی 2.77 پچ‌شده را نصب کن.</p></details>
+          <details class="guide"><summary>دمای مناسب چند است؟</summary>
+            <ul>
+              <li><b>Inlet Ambient:</b> زیر ۲۷ درجه عالی است و تا ۳۵ درجه قابل قبول.</li>
+              <li><b>CPU:</b> در بیکاری ۳۵ تا ۵۰ درجه و زیر بار تا ۷۵ درجه بدون نگرانی. حد Caution معمولاً حدود ۷۰ درجه بالاتر از دمای محیط تنظیم شده است.</li>
+              <li><b>DIMM:</b> زیر ۶۵ درجه.</li>
+              <li><b>HDD:</b> زیر ۴۵ درجه برای عمر طولانی دیسک.</li>
+              <li><b>Chipset و PCIe:</b> معمولاً تا ۷۰ تا ۸۵ درجه مشکلی ندارند. به آستانه‌ی Caution خود حسگر نگاه کن.</li>
+            </ul></details>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ===================================================== settings sheet -->
+  <div class="sheet" id="sheet" hidden>
+    <div class="sheet-backdrop" data-close></div>
+    <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+      <div class="sheet-head">
+        <h2 id="sheetTitle">Servers &amp; settings</h2>
+        <span class="spacer"></span>
+        <button class="icon-btn" data-close aria-label="Close">×</button>
+      </div>
+
+      <div class="sheet-body">
+        <section class="sheet-sec">
+          <div class="card-head">
+            <h3>Servers</h3>
+            <span class="spacer"></span>
+            <button class="primary" id="addServerBtn">+ Add server</button>
+          </div>
+          <div id="serverList" class="server-list"></div>
+        </section>
+
+        <section class="sheet-sec" id="serverFormSec" hidden>
+          <div class="card-head"><h3 id="serverFormTitle">Add server</h3></div>
+          <form id="serverForm" class="form-grid" autocomplete="off">
+            <label>Name<input name="name" placeholder="e.g. Rack 1 — DL380p"></label>
+            <label>iLO address<input name="host" placeholder="192.168.1.120" required></label>
+            <label>Username<input name="username" value="Administrator" autocomplete="off"></label>
+            <label>Password<input name="password" type="password" autocomplete="new-password"></label>
+            <label>Minimum fan speed (%)
+              <input name="min_pwm_percent" type="number" min="0" max="60" value="8"></label>
+            <details class="adv full">
+              <summary>Advanced</summary>
+              <div class="form-grid">
+                <label>SSH port<input name="ssh_port" type="number" value="22"></label>
+                <label>HTTPS port<input name="https_port" type="number" value="443"></label>
+                <label>Poll interval (s)
+                  <input name="poll_seconds" type="number" min="5" max="120" value="10"></label>
+                <label>Watchdog margin (°C)
+                  <input name="watchdog_margin_c" type="number" min="0" max="30" value="5"></label>
+                <label>Re-send every (min, 0 = off)
+                  <input name="reassert_minutes" type="number" min="0" max="120" value="5"></label>
+                <label class="cbx"><input name="watchdog_enabled" type="checkbox" checked> Thermal watchdog</label>
+                <label class="cbx"><input name="enabled" type="checkbox" checked> Monitoring enabled</label>
+              </div>
+            </details>
+            <div class="test-box full" id="testBox" hidden></div>
+            <div class="row full">
+              <button type="button" class="ghost" id="serverCancel">Cancel</button>
+              <span class="spacer"></span>
+              <button type="button" id="serverTest">Test connection</button>
+              <button type="submit" class="primary" id="serverSave">Save</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="sheet-sec">
+          <div class="card-head">
+            <h3>History storage</h3>
+            <span class="info" tabindex="0" data-tip="Every sample is kept at full resolution this long. After that it's stored as 5-minute averages for 35 days and hourly averages for 2 years, so the database stays small.">i</span>
+          </div>
+          <div class="row wrap">
+            <label>Full resolution for</label>
+            <input id="histRetention" type="number" min="6" max="336" style="width:5rem">
+            <span class="unit">hours</span>
+            <button id="histRetentionSave" class="ghost">Save</button>
+          </div>
+          <p class="hint" id="dbStats"></p>
+        </section>
+
+        <section class="sheet-sec">
+          <div class="card-head">
+            <h3>Send to InfluxDB</h3>
+            <span class="info" tabindex="0" data-tip="Optional. Every sample from every server is also queued to InfluxDB in the background, tagged host=<server name>, kind and name.">i</span>
+            <span class="spacer"></span>
+            <label class="switch"><input type="checkbox" id="influxOn"><span></span></label>
+          </div>
+          <div class="form-grid" id="influxForm">
+            <label>Version<select id="influxVersion"><option value="1">InfluxDB 1.x</option><option value="2">InfluxDB 2.x</option></select></label>
+            <label>URL<input id="influxUrl" placeholder="http://192.168.1.10:8086"></label>
+            <label>Measurement<input id="influxMeasurement" placeholder="ilo4"></label>
+            <label data-v="1">Database<input id="influxDb" placeholder="ilo4"></label>
+            <label data-v="1">Username<input id="influxUser" placeholder="optional"></label>
+            <label data-v="1">Password<input id="influxPass" type="password" placeholder="optional"></label>
+            <label data-v="2">Org<input id="influxOrg"></label>
+            <label data-v="2">Bucket<input id="influxBucket" placeholder="ilo4"></label>
+            <label data-v="2">Token<input id="influxToken" type="password"></label>
+            <label class="cbx"><input type="checkbox" id="influxTls" checked> verify TLS</label>
+          </div>
+          <div class="row">
+            <span class="hint" id="influxStatus"></span>
+            <span class="spacer"></span>
+            <button id="influxTest" class="ghost">Test</button>
+            <button id="influxSave" class="primary">Save</button>
+          </div>
+        </section>
+
+        <section class="sheet-sec">
+          <div class="card-head"><h3>App</h3></div>
+          <div class="row wrap">
+            <button id="installBtn" hidden>Install as app</button>
+            <button id="changePanelBtn" hidden>Change panel address</button>
+            <button id="logoutBtn" class="ghost">Sign out</button>
+            <span class="spacer"></span>
+            <span class="ver" id="ver">—</span>
+          </div>
+          <p class="hint" id="installHint"></p>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- delete confirmation -->
+  <div class="sheet" id="delDialog" hidden>
+    <div class="sheet-backdrop" data-close></div>
+    <div class="sheet-card small" role="alertdialog" aria-modal="true">
+      <div class="sheet-head"><h2>Remove <span id="delName"></span>?</h2></div>
+      <div class="sheet-body">
+        <label class="cbx"><input type="checkbox" id="delRestore" checked> Hand its fans back to iLO first</label>
+        <label class="cbx"><input type="checkbox" id="delHistory"> Also delete its recorded history</label>
+        <div class="row">
+          <span class="spacer"></span>
+          <button class="ghost" data-close>Cancel</button>
+          <button class="danger" id="delConfirm">Remove</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <div class="tip" id="tip" hidden></div>
+</div>
+
+<script src="app.js?v={{V}}"></script>
+<script src="history.js?v={{V}}"></script>
+</body>
+</html>

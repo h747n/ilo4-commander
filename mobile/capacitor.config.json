@@ -1,0 +1,17 @@
+{
+  "appId": "local.ilo4commander.app",
+  "appName": "iLO Fans",
+  "webDir": "www",
+  "appendUserAgent": "iLOCommanderApp",
+  "backgroundColor": "#0B0E13",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true,
+    "allowNavigation": ["*"]
+  },
+  "android": {
+    "allowMixedContent": true,
+    "appendUserAgent": "iLOCommanderApp",
+    "backgroundColor": "#0B0E13"
+  }
+}

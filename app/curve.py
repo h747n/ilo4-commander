@@ -1,0 +1,287 @@
+"""Host-side fan curve plus a thermal watchdog, for one server.
+
+The patched iLO gives you registers, not a curve. The server's worker calls
+`CurveEngine.step()` once per poll with fresh temperatures; this works out a
+duty cycle from the user's points and writes it over SSH - with hysteresis
+and ramp limits so the fans don't oscillate, and a watchdog that hands
+control back to iLO when a sensor gets close to its caution threshold.
+
+Unlike the old version, a watchdog trip no longer switches the curve off for
+good. It parks it, and once every sensor has cooled down again the curve
+picks up by itself.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from .config import JsonStore
+from .servers import server_dir
+
+DEFAULT_POINTS = [[35, 10], [50, 18], [60, 30], [70, 50], [80, 80], [90, 100]]
+LEGACY_KEYS = ("points", "sensors", "per_fan_floor")
+
+DEFAULT_CURVE: Dict[str, Any] = {
+    "enabled": False,
+    "hysteresis_c": 2,
+    "ramp_up_step": 12,
+    "ramp_down_step": 4,
+    "watchdog_auto_resume": True,
+    # Each profile is its own curve: its own sensor and its own points. Every
+    # fan is bound to exactly one profile.
+    "profiles": [{"id": "default", "name": "All fans", "sensor": "__cpu__",
+                  "points": [list(p) for p in DEFAULT_POINTS]}],
+    "assign": {},           # fan index (as a string) -> profile id
+}
+
+RESUME_BELOW_C = 5          # extra degrees under the trip point before resuming
+RESUME_TICKS = 3            # ...held for this many polls in a row
+RESUME_MIN_S = 120          # ...and never sooner than this after the trip
+
+
+def normalize(cfg: Dict[str, Any], fan_count: int = 6) -> Dict[str, Any]:
+    """Return a config that is always safe to iterate over.
+
+    Also migrates the pre-2.1 shape (one set of points at the top level).
+    """
+    out = dict(DEFAULT_CURVE, **cfg)
+    profiles = [p for p in (out.get("profiles") or []) if isinstance(p, dict)]
+    if cfg.get("points") and not cfg.get("profiles"):
+        profiles = [{"id": "default", "name": "All fans",
+                     "sensor": (cfg.get("sensors") or ["__cpu__"])[0],
+                     "points": cfg["points"]}]
+    for key in LEGACY_KEYS + ("poll_seconds",):
+        out.pop(key, None)
+    if not profiles:
+        profiles = [dict(DEFAULT_CURVE["profiles"][0])]
+
+    clean, seen = [], set()
+    for i, prof in enumerate(profiles):
+        pid = str(prof.get("id") or f"p{i}")
+        while pid in seen:
+            pid += "_"
+        seen.add(pid)
+        pts = []
+        for pair in (prof.get("points") or []):
+            try:
+                t, v = int(pair[0]), int(pair[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            pts.append([max(0, min(120, t)), max(0, min(100, v))])
+        pts.sort(key=lambda q: q[0])
+        if len(pts) < 2:
+            pts = [list(q) for q in DEFAULT_POINTS]
+        clean.append({"id": pid, "name": str(prof.get("name") or pid),
+                      "sensor": str(prof.get("sensor") or "__cpu__"), "points": pts})
+    out["profiles"] = clean
+
+    ids = {p["id"] for p in clean}
+    raw = out.get("assign") or {}
+    out["assign"] = {str(i): (str(raw.get(str(i))) if str(raw.get(str(i))) in ids
+                              else clean[0]["id"])
+                     for i in range(max(1, int(fan_count)))}
+    out["hysteresis_c"] = max(0.0, min(10.0, float(out.get("hysteresis_c", 2))))
+    out["ramp_up_step"] = max(1, min(100, int(out.get("ramp_up_step", 12))))
+    out["ramp_down_step"] = max(1, min(100, int(out.get("ramp_down_step", 4))))
+    out["enabled"] = bool(out.get("enabled"))
+    out["watchdog_auto_resume"] = bool(out.get("watchdog_auto_resume", True))
+    return out
+
+
+def interpolate(points: List[List[float]], temp: float) -> float:
+    pts = sorted((float(t), float(p)) for t, p in points)
+    if not pts:
+        return 100.0
+    if temp <= pts[0][0]:
+        return pts[0][1]
+    if temp >= pts[-1][0]:
+        return pts[-1][1]
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        if t0 <= temp <= t1:
+            return p0 + (p1 - p0) * (temp - t0) / ((t1 - t0) or 1.0)
+    return pts[-1][1]
+
+
+def hot_sensor(temps: List[Dict[str, Any]], wanted: str) -> Tuple[Optional[str], Optional[float]]:
+    """Hottest sensor matching the selection.
+
+    `__hottest__` takes anything, `__cpu__` takes the CPU sensors (HP names
+    them like "02-CPU 1"), otherwise an exact name, then a substring match.
+    """
+    def pick(match) -> Tuple[Optional[str], Optional[float]]:
+        name_, val_ = None, None
+        for t in temps:
+            v, n = t.get("reading"), (t.get("name") or "")
+            if isinstance(v, (int, float)) and v > 0 and match(n) and (val_ is None or v > val_):
+                name_, val_ = n, float(v)
+        return name_, val_
+
+    if not wanted or wanted == "__hottest__":
+        return pick(lambda n: True)
+    if wanted == "__cpu__":
+        return pick(lambda n: "cpu" in n.lower() or "proc" in n.lower())
+    hit = pick(lambda n: n.lower() == wanted.lower())
+    return hit if hit[1] is not None else pick(lambda n: wanted.lower() in n.lower())
+
+
+class CurveEngine:
+    def __init__(self, sid: str, fans, log) -> None:
+        self.store = JsonStore(server_dir(sid) / "curve.json", DEFAULT_CURVE)
+        self.fans = fans                 # FanControl
+        self.log = log                   # callable(kind, message)
+        self.profile_state: Dict[str, Dict[str, Any]] = {}
+        self.applied: Dict[str, int] = {}
+        self.temps_seen: Dict[str, float] = {}
+        self.fan_applied: Dict[int, int] = {}
+        self.last_error: Optional[str] = None
+        self.last_run: Optional[float] = None
+        self.tripped_at: Optional[float] = None
+        self.trip_reason: Optional[str] = None
+        self._cool_ticks = 0
+        self._lock = threading.RLock()
+
+    # ------------------------------------------------------------------ #
+    def config(self, fan_count: int) -> Dict[str, Any]:
+        return normalize(self.store.read(), fan_count)
+
+    def save(self, cfg: Dict[str, Any], fan_count: int) -> Dict[str, Any]:
+        merged = dict(self.store.read(), **cfg)
+        clean = normalize(merged, fan_count)
+        self.store.write(clean)
+        self.reset_applied()
+        return clean
+
+    def reset_applied(self) -> None:
+        """Forget what we think is on the fans, so the next step rewrites them."""
+        self.applied.clear()
+        self.temps_seen.clear()
+        self.fan_applied.clear()
+
+    @property
+    def tripped(self) -> bool:
+        return self.tripped_at is not None
+
+    # ------------------------------------------------------------------ #
+    def watchdog(self, temps: List[Dict[str, Any]], srv: Dict[str, Any],
+                 managed: bool) -> None:
+        """Trip when any sensor gets within the margin of its caution threshold."""
+        if not srv.get("watchdog_enabled", True):
+            self.tripped_at = None
+            return
+        margin = float(srv.get("watchdog_margin_c", 5))
+        hottest_gap, culprit, over = None, None, []
+        for t in temps:
+            val = t.get("reading")
+            kind, limit = ("caution", t.get("caution")) if t.get("caution") else ("critical", t.get("critical"))
+            if not isinstance(val, (int, float)) or not isinstance(limit, (int, float)) or not limit:
+                continue
+            gap = (limit - margin) - val            # <= 0 means trip
+            if gap <= 0:
+                over.append(f"{t.get('name')} {val}°C")
+            if hottest_gap is None or gap < hottest_gap:
+                hottest_gap, culprit = gap, (t.get("name"), val, kind, limit)
+
+        if hottest_gap is None:
+            return
+        if not self.tripped:
+            if hottest_gap <= 0 and managed:
+                name, val, kind, limit = culprit
+                self.tripped_at = time.time()
+                self.trip_reason = (f"{name} reached {val}°C — trip point {limit - margin:g}°C "
+                                    f"({kind} {limit:g}°C minus {margin:g}°C margin)")
+                others = [o for o in over if not o.startswith(f"{name} ")]
+                self._cool_ticks = 0
+                restore_err = ""
+                try:
+                    self.fans.restore_auto()
+                except Exception as exc:      # noqa: BLE001
+                    restore_err = f" Handing back FAILED: {exc}"
+                self.reset_applied()
+                self.log("watchdog", f"Watchdog: {self.trip_reason}."
+                         + (f" Also over: {', '.join(others)}." if others else "")
+                         + (restore_err or " All fans handed back to iLO."))
+            return
+
+        # Tripped: wait for everything to cool down, then resume.
+        if hottest_gap >= RESUME_BELOW_C:
+            self._cool_ticks += 1
+        else:
+            self._cool_ticks = 0
+        cfg = self.store.read()
+        if (cfg.get("watchdog_auto_resume", True) and self._cool_ticks >= RESUME_TICKS
+                and time.time() - (self.tripped_at or 0) >= RESUME_MIN_S):
+            name, val, _kind, limit = culprit
+            mins = int((time.time() - (self.tripped_at or time.time())) // 60)
+            self.tripped_at = self.trip_reason = None
+            self.reset_applied()
+            self.log("watchdog", f"Cooled down after {mins} min (closest now: {name} {val}°C, "
+                                 f"trip point {limit - margin:g}°C) — curve control resumed.")
+
+    def clear_trip(self) -> None:
+        if self.tripped:
+            self.tripped_at = self.trip_reason = None
+            self.reset_applied()
+            self.log("watchdog", "Watchdog cleared by hand.")
+
+    # ------------------------------------------------------------------ #
+    def step(self, temps: List[Dict[str, Any]], fan_count: int) -> None:
+        # The worker's poll and an API "apply now" can both get here.
+        with self._lock:
+            self._step(temps, fan_count)
+
+    def _step(self, temps: List[Dict[str, Any]], fan_count: int) -> None:
+        cfg = self.config(fan_count)
+        self.last_run = time.time()
+        if not cfg["enabled"] or self.tripped:
+            self.profile_state = {}
+            return
+
+        by_profile: Dict[str, List[int]] = {}
+        for fan, pid in cfg["assign"].items():
+            by_profile.setdefault(pid, []).append(int(fan))
+        profiles = {p["id"]: p for p in cfg["profiles"]}
+        hyst, up, down = cfg["hysteresis_c"], cfg["ramp_up_step"], cfg["ramp_down_step"]
+        live: Dict[str, Dict[str, Any]] = {}
+
+        for pid, fan_list in by_profile.items():
+            prof = profiles.get(pid)
+            if not prof:
+                continue
+            name, temp = hot_sensor(temps, prof["sensor"])
+            if temp is None:
+                name, temp = hot_sensor(temps, "__hottest__")
+            if temp is None:
+                continue
+            target = int(round(interpolate(prof["points"], temp)))
+            prev, seen = self.applied.get(pid), self.temps_seen.get(pid)
+            if prev is not None:
+                if seen is not None and abs(temp - seen) < hyst and abs(target - prev) < 5:
+                    target = prev
+                target = min(prev + up, max(prev - down, target))
+            # Report what actually reaches the fans: set_pwm never goes below the floor.
+            clamp = getattr(self.fans, "_clamp", None)
+            if clamp:
+                target = clamp(target)
+            for fan in sorted(fan_list):
+                if self.fan_applied.get(fan) != target:
+                    self.fans.set_pwm(fan, target, "max", remember=False)
+                    self.fan_applied[fan] = target
+            self.applied[pid] = target
+            if prev is None or target != prev:
+                self.temps_seen[pid] = temp
+            live[pid] = {"name": prof["name"], "sensor": name, "temp": round(temp, 1),
+                         "applied": target, "fans": sorted(fan_list)}
+        self.profile_state = live
+        self.last_error = None
+
+    def status(self, fan_count: int) -> Dict[str, Any]:
+        return {
+            "config": self.config(fan_count),
+            "profile_state": self.profile_state,
+            "fan_applied": {str(k): v for k, v in self.fan_applied.items()},
+            "last_run": self.last_run,
+            "last_error": self.last_error,
+            "tripped_at": self.tripped_at,
+            "trip_reason": self.trip_reason,
+        }

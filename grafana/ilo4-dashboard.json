@@ -1,0 +1,196 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_ILO4",
+      "label": "iLO4 Commander InfluxDB",
+      "description": "Point this at whichever InfluxDB the panel is configured to export to. An existing InfluxDB server works fine - just use a separate database/bucket (this dashboard assumes measurement \"ilo4\").",
+      "type": "datasource",
+      "pluginId": "influxdb",
+      "pluginName": "InfluxDB"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0" },
+    { "type": "datasource", "id": "influxdb", "name": "InfluxDB", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" }
+  ],
+  "id": null,
+  "uid": "ilo4-commander",
+  "title": "iLO4 Commander",
+  "description": "Sensor temperatures, fan speeds and power draw exported by iLO4 Commander. Queries assume InfluxQL against the \"ilo4\" measurement (tags: host, kind, name; field: value).",
+  "tags": ["ilo4", "hpe", "ilo"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Hottest sensor right now",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 65 },
+              { "color": "red", "value": 80 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto",
+                   "textMode": "auto", "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT max(\"value\") FROM \"ilo4\" WHERE \"kind\"='temp' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Power draw",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "watt" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto",
+                   "textMode": "auto", "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT mean(\"value\") FROM \"ilo4\" WHERE \"kind\"='power' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Mean fan speed",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto",
+                   "textMode": "auto", "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT mean(\"value\") FROM \"ilo4\" WHERE \"kind\"='fan' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Samples (last hour)",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto",
+                   "textMode": "auto", "colorMode": "none" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT count(\"value\") FROM \"ilo4\" WHERE \"kind\"='temp' AND time > now()-1h",
+          "rawQuery": true,
+          "resultFormat": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Sensor temperatures",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "pointSize": 3 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT mean(\"value\") FROM \"ilo4\" WHERE \"kind\"='temp' AND $timeFilter GROUP BY time($__interval), \"name\" fill(null)",
+          "rawQuery": true,
+          "alias": "$tag_name",
+          "resultFormat": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Fan speeds",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent", "max": 100, "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "pointSize": 3 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT mean(\"value\") FROM \"ilo4\" WHERE \"kind\"='fan' AND $timeFilter GROUP BY time($__interval), \"name\" fill(null)",
+          "rawQuery": true,
+          "alias": "$tag_name",
+          "resultFormat": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Power draw",
+      "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 15, "pointSize": 3 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["last", "mean", "max"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "${DS_ILO4}" },
+          "query": "SELECT mean(\"value\") FROM \"ilo4\" WHERE \"kind\"='power' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "alias": "watts",
+          "resultFormat": "time_series"
+        }
+      ]
+    }
+  ]
+}
