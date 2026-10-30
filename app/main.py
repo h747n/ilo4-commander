@@ -11,8 +11,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from urllib.parse import urlparse
+
 from fastapi import (Body, Cookie, Depends, FastAPI, HTTPException, Query,
-                     Response, WebSocket, WebSocketDisconnect)
+                     Request, Response, WebSocket, WebSocketDisconnect)
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -21,7 +23,8 @@ from .config import VERSION, history_store, settings
 from .history_db import RANGES, history_db, maintenance
 from .influx import influx, influx_store, merge_secret
 from .redfish import Redfish, RedfishError
-from .servers import ServerError, public, registry
+from .servers import (CONNECTION_KEYS, FIELDS, ServerError, connection_changed,
+                      public, registry)
 from .ssh_client import IloShell, IloSshError
 from .worker import ServerWorker, fleet
 
@@ -44,6 +47,27 @@ app = FastAPI(title="iLO4 Commander", version=VERSION, lifespan=lifespan,
               docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json")
 
 
+def same_origin(origin: Optional[str], host: Optional[str]) -> bool:
+    """Browsers always send Origin on cross-site writes and WebSocket opens.
+    No Origin at all means curl or a script, which a malicious page can't be."""
+    if origin is None:
+        return True
+    try:
+        return bool(host) and urlparse(origin).netloc.lower() == host.lower()
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def reject_cross_site_writes(request: Request, call_next):
+    # Blocks another website, open in the same browser, from driving the fans
+    # through this panel - even when no panel password is set.
+    if request.method not in ("GET", "HEAD", "OPTIONS") and \
+            not same_origin(request.headers.get("origin"), request.headers.get("host")):
+        return JSONResponse(status_code=403, content={"detail": "Cross-site request refused."})
+    return await call_next(request)
+
+
 # --------------------------------------------------------------------- #
 # Login
 # --------------------------------------------------------------------- #
@@ -60,15 +84,26 @@ def auth_state(ilo_session: Optional[str] = Cookie(default=None)) -> Dict[str, A
     return {"required": auth.required(), "signed_in": auth.valid(ilo_session), "version": VERSION}
 
 
+_fails: Dict[str, List[float]] = {}
+LOCK_AFTER, LOCK_WINDOW_S = 5, 300
+
+
 @app.post("/api/login")
-def login(response: Response, password: str = Body(..., embed=True)) -> Dict[str, Any]:
+def login(request: Request, response: Response,
+          password: str = Body(..., embed=True)) -> Dict[str, Any]:
     if not auth.required():
         return {"ok": True}
+    ip, now = (request.client.host if request.client else "?"), time.time()
+    recent = [t for t in _fails.get(ip, []) if now - t < LOCK_WINDOW_S]
+    if len(recent) >= LOCK_AFTER:
+        raise HTTPException(status_code=429, detail="Too many wrong passwords. Try again in a few minutes.")
     if not auth.check_password(password):
+        _fails[ip] = recent + [now]
         time.sleep(0.6)
         raise HTTPException(status_code=401, detail="That password doesn't match.")
+    _fails.pop(ip, None)
     response.set_cookie(auth.COOKIE, auth.issue(), httponly=True, samesite="lax",
-                        max_age=auth.max_age())
+                        secure=request.url.scheme == "https", max_age=auth.max_age())
     return {"ok": True}
 
 
@@ -127,11 +162,20 @@ def servers_list() -> Dict[str, Any]:
 def servers_test(server: Dict[str, Any] = Body(..., embed=True)) -> Dict[str, Any]:
     """Try the address and credentials before saving them."""
     cfg = dict(server)
-    if cfg.get("id") and (not cfg.get("password") or cfg["password"].startswith("•")):
-        saved = registry.get(cfg["id"]) or {}
-        cfg["password"] = saved.get("password", "")
     cfg.setdefault("username", "Administrator")
     cfg["host"] = str(cfg.get("host", "")).replace("https://", "").replace("http://", "").strip("/ ")
+    if cfg.get("id") and (not cfg.get("password") or str(cfg["password"]).startswith("•")):
+        # Reuse the stored password only against the stored address: never send
+        # it to a host, port or username that arrived with this request.
+        saved = registry.get(str(cfg["id"]))
+        if not saved:
+            raise HTTPException(status_code=404, detail="No such server.")
+        stored = dict(FIELDS, **saved)
+        asked = {**stored, **{k: cfg[k] for k in CONNECTION_KEYS if k in cfg}}
+        if connection_changed(stored, asked):
+            raise HTTPException(status_code=400,
+                                detail="Enter the iLO password to test a changed address, port or username.")
+        cfg["password"] = saved["password"]
     out: Dict[str, Any] = {"redfish": {"ok": False}, "ssh": {"ok": False}}
     rf = Redfish(cfg)
     try:
@@ -428,6 +472,9 @@ def influx_test(config: Dict[str, Any] = Body(..., embed=True)) -> Dict[str, Any
 # --------------------------------------------------------------------- #
 @app.websocket("/ws")
 async def ws_live(ws: WebSocket) -> None:
+    if not same_origin(ws.headers.get("origin"), ws.headers.get("host")):
+        await ws.close(code=4403)          # another website trying to read the feed
+        return
     if not auth.valid(ws.cookies.get(auth.COOKIE)):
         await ws.close(code=4401)
         return

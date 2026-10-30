@@ -100,7 +100,8 @@ class Registry:
             data = self._store.read()
             if any(s["host"] == cfg["host"] for s in data["servers"]):
                 raise ServerError(f"{cfg['host']} is already in the list.")
-            cfg["id"] = raw.get("id") or _new_id(cfg["name"])
+            # Never take an id from the client: it ends up in a filesystem path.
+            cfg["id"] = _new_id(cfg["name"])
             data["servers"].append(cfg)
             self._store.write(data)
         server_dir(cfg["id"]).mkdir(parents=True, exist_ok=True)
@@ -111,8 +112,13 @@ class Registry:
             data = self._store.read()
             for i, s in enumerate(data["servers"]):
                 if s["id"] == sid:
-                    cfg = _clean(raw, dict(FIELDS, **s))
+                    old = dict(FIELDS, **s)
+                    cfg = _clean(raw, old)
                     cfg["id"] = sid
+                    if connection_changed(old, cfg) and raw.get("password") in (None, "", MASK):
+                        # Otherwise the stored password would be sent to the new address.
+                        raise ServerError("Enter the iLO password again when you change "
+                                          "the address, a port or the username.")
                     if any(o["host"] == cfg["host"] and o["id"] != sid for o in data["servers"]):
                         raise ServerError(f"{cfg['host']} is already in the list.")
                     data["servers"][i] = cfg
@@ -135,7 +141,17 @@ class Registry:
             self._store.write(data)
 
 
+CONNECTION_KEYS = ("host", "username", "ssh_port", "https_port", "verify_tls")
+_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
+
+
+def connection_changed(old: Dict[str, Any], new: Dict[str, Any]) -> bool:
+    return any(str(old.get(k)) != str(new.get(k)) for k in CONNECTION_KEYS)
+
+
 def server_dir(sid: str) -> Path:
+    if not _ID.fullmatch(sid or ""):
+        raise ServerError("Invalid server id.")
     return SERVERS_DIR / sid
 
 

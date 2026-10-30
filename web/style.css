@@ -281,14 +281,14 @@ output.muted{color:var(--faint)}
 .legend b{color:var(--ink);font-weight:400;font-variant-numeric:tabular-nums}
 
 .activity{display:grid;gap:1px;max-height:320px;overflow:auto}
-.act{display:grid;grid-template-columns:5.6rem 1fr;gap:.8rem;padding:.42rem .6rem;
+.act{display:grid;grid-template-columns:auto 1fr;gap:.8rem;padding:.42rem .6rem;
   border-left:2px solid var(--line);font-size:12.5px;background:var(--sunk);border-radius:0 4px 4px 0}
-.act time{font-family:var(--mono);font-size:10.5px;color:var(--faint);padding-top:.1rem}
-.act.power{border-left-color:var(--uid)}
-.act.reassert{border-left-color:var(--ok)}
-.act.watchdog,.act.handback{border-left-color:var(--caution)}
-.act.watchdog span{color:var(--ink)}
-.act.link{border-left-color:var(--crit)}
+.act time{font-family:var(--mono);font-size:10.5px;color:var(--faint);padding-top:.1rem;white-space:nowrap}
+.act.ev-power{border-left-color:var(--uid)}
+.act.ev-reassert{border-left-color:var(--ok)}
+.act.ev-watchdog,.act.ev-handback{border-left-color:var(--caution)}
+.act.ev-watchdog span{color:var(--ink)}
+.act.ev-link{border-left-color:var(--crit)}
 
 /* ---------- sensors tab ---------- */
 .sensor-groups{display:grid;gap:1.4rem}

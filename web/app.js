@@ -491,7 +491,7 @@ function renderActivity() {
   evs.forEach(e => box.appendChild(activityRow(e)));
 }
 function activityRow(e) {
-  const r = el("div", "act " + (e.kind || ""));
+  const r = el("div", "act ev-" + (e.kind || "info"));
   r.innerHTML = `<time>${esc(fmtClock(e.ts))}</time><span>${esc(e.message)}</span>`;
   return r;
 }
