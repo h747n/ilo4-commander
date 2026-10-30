@@ -120,7 +120,11 @@ else
   fi
 fi
 
-if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then systemctl stop "$SVC_NAME"; fi
+if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
+  systemctl stop "$SVC_NAME"
+  # Whatever happens below, don't leave the fans without their controller.
+  trap 'systemctl start "$SVC_NAME" 2>/dev/null || true' EXIT
+fi
 WANT_PORT="${PORT:-$(env_get BIND_PORT "$PREFIX/.env")}"; WANT_PORT="${WANT_PORT:-8080}"
 if command -v ss >/dev/null && ss -ltnH "sport = :$WANT_PORT" | grep -q .; then
   HOLDER="$(ss -ltnpH "sport = :$WANT_PORT" | grep -o 'users:(("[^"]*' | head -1 | cut -d'"' -f2)"
@@ -162,11 +166,29 @@ fi
 
 step "Installing Python dependencies"
 [ -x "$PREFIX/venv/bin/python" ] || python3 -m venv "$PREFIX/venv"
-"$PREFIX/venv/bin/pip" install -q --upgrade pip
-"$PREFIX/venv/bin/pip" install -q -r "$PREFIX/requirements.txt"
+# An upgrade usually needs nothing new: check the pinned versions first, so a
+# VM without internet doesn't hang on pip.
+if "$PREFIX/venv/bin/python" - "$PREFIX/requirements.txt" <<'PYEOF'
+import sys, importlib.metadata as md
+for line in open(sys.argv[1]):
+    line = line.split("#")[0].strip()
+    if not line:
+        continue
+    name, _, ver = line.partition("==")
+    try:
+        if md.version(name.split("[")[0]) != ver:
+            sys.exit(1)
+    except md.PackageNotFoundError:
+        sys.exit(1)
+PYEOF
+then
+  ok "Dependencies already up to date"
+else
+  "$PREFIX/venv/bin/pip" install -q --disable-pip-version-check --timeout 15 --retries 1 \
+    -r "$PREFIX/requirements.txt" || die "Couldn't download Python packages - does this machine have internet?"
+fi
 chown -R "$SVC_USER":"$SVC_USER" "$PREFIX"
 chmod 600 "$PREFIX/.env"
-ok "Dependencies installed"
 
 for d in ${MIGRATE[@]+"${MIGRATE[@]}"}; do
   step "Importing old install: $d"

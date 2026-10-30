@@ -61,6 +61,11 @@ class ServerWorker(threading.Thread):
         self.manager: Optional[Dict[str, Any]] = None
         self.recent: Deque[Dict[str, Any]] = deque(maxlen=RECENT_LEN)
         self.events: Deque[Dict[str, Any]] = deque(maxlen=40)
+        try:        # pick up where we left off, so a restart doesn't blank the Activity card
+            now = int(time.time())
+            self.events.extend(history_db.events(self.sid, now - 7 * 86400, now, 40))
+        except Exception:      # noqa: BLE001
+            pass
         self.snapshot: Dict[str, Any] = {}
         self.seq = 0
 
