@@ -1,12 +1,17 @@
 # Builds the Android app in the cloud - no Android SDK needed on your machine.
-# Push this repo to GitHub, open Actions -> "Android APK" -> Run workflow,
-# then download ilo-fans-apk from the finished run.
+# Every build is published as the "android-latest" release, so the newest APK
+# is always at:
+#   https://github.com/<owner>/<repo>/releases/download/android-latest/ilo-fans.apk
 name: Android APK
 
 on:
   workflow_dispatch:
   push:
-    paths: ["mobile/**", "web/icons/**"]
+    branches: [main]
+    paths: ["mobile/**", "web/icons/**", ".github/workflows/android-apk.yml"]
+
+permissions:
+  contents: write          # to publish the release
 
 jobs:
   build:
@@ -29,3 +34,12 @@ jobs:
         with:
           name: ilo-fans-apk
           path: mobile/dist/ilo-fans.apk
+      - name: Publish as the android-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete android-latest --yes --cleanup-tag || true
+          gh release create android-latest dist/ilo-fans.apk \
+            --prerelease --target "$GITHUB_SHA" \
+            --title "Android app (latest build)" \
+            --notes "Built from ${GITHUB_SHA::7}. Install on Android, then enter your panel's address (for example http://192.168.1.50:8080)."

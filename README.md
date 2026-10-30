@@ -62,9 +62,12 @@ SSL_KEY=/etc/ssl/internal/panel.key
 ### ۲) APK اندروید
 پوشه‌ی `mobile/` یک اپ Capacitor است. بار اول آدرس پنل را می‌پرسد (مثلاً `http://192.168.1.50:8080`)، همان را به خاطر می‌سپارد و از آن به بعد پنل را تمام‌صفحه باز می‌کند. با **HTTP معمولی هم کار می‌کند** و به گواهی نیاز ندارد. برای عوض کردن آدرس: چرخ‌دنده، بعد *Change panel address*.
 
-ساختن APK:
+**دانلود آماده:** آخرین نسخه همیشه از این لینک دانلود می‌شود:
+https://github.com/h747n/ilo4-commander/releases/download/android-latest/ilo-fans.apk
 
-- **بدون نصب هیچ چیز (پیشنهادی):** پروژه را روی GitHub بگذار (repo خصوصی هم کار می‌کند)، در تب Actions گزینه‌ی **Android APK → Run workflow** را بزن و فایل `ilo-fans-apk` را از اجرای تمام‌شده دانلود کن.
+ساختن APK خودت:
+
+- **بدون نصب هیچ چیز (پیشنهادی):** روی fork خودت در تب Actions گزینه‌ی **Android APK → Run workflow** را بزن. APK در قسمت Artifacts اجرای تمام‌شده و در Release با نام `android-latest` قرار می‌گیرد.
 - **روی سیستم خودت:** به Node 18 یا جدیدتر، JDK 17 و Android SDK (با متغیر `ANDROID_HOME`) نیاز داری:
   ```bash
   cd mobile
