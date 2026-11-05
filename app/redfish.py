@@ -85,6 +85,11 @@ class Redfish:
         self._basic_only = False              # set if this iLO refuses session login
         self._last_io = 0.0
         self.last_error: Optional[str] = None
+        # The iLO web UI's own JSON API. Redfish on many iLO 4 builds leaves the
+        # fan speed out entirely; the web UI's Fans page reads it from here.
+        self._web_key: Optional[str] = None
+        self._web_retry_at = 0.0              # back off if this API isn't there
+        self.fan_source = "redfish"
 
     def _new_session(self) -> requests.Session:
         s = requests.Session()
@@ -114,7 +119,44 @@ class Redfish:
             # Old firmware without SessionService: plain Basic auth still works.
             self._basic_only = True
 
+    def _web_fan_speeds(self) -> Optional[List[Dict[str, Any]]]:
+        """Fan list from /json/health_fans (label, speed %), or None if unavailable."""
+        if time.time() < self._web_retry_at:
+            return None
+        for attempt in (1, 2):
+            try:
+                with self._net:
+                    if self._web_key is None:
+                        r = self._s.post(self.base + "/json/login_session", timeout=TIMEOUT, json={
+                            "method": "login", "user_login": self.cfg["username"],
+                            "password": self.cfg["password"]})
+                        if r.status_code != 200 or not r.json().get("session_key"):
+                            raise RedfishError(f"web login {r.status_code}")
+                        self._web_key = r.json()["session_key"]
+                    r = self._s.get(self.base + "/json/health_fans", timeout=TIMEOUT,
+                                    cookies={"sessionKey": self._web_key})
+                    self._last_io = time.time()
+                if r.status_code in (401, 403) and attempt == 1:
+                    self._web_key = None          # session expired: log in again once
+                    continue
+                if r.status_code != 200:
+                    raise RedfishError(f"health_fans {r.status_code}")
+                return r.json().get("fans") or []
+            except Exception:      # noqa: BLE001 - optional source; try again in 5 minutes
+                self._web_key = None
+                self._web_retry_at = time.time() + 300
+                return None
+        return None
+
     def logout(self) -> None:
+        if self._web_key:
+            try:
+                with self._net:
+                    self._s.post(self.base + "/json/login_session", timeout=(3, 5),
+                                 json={"method": "logout", "session_key": self._web_key})
+            except Exception:      # noqa: BLE001
+                pass
+            self._web_key = None
         if self._token and self._session_uri:
             try:
                 with self._net:
@@ -199,6 +241,18 @@ class Redfish:
                 "state": st.get("State", "Unknown"),
                 "health": st.get("Health", "Unknown"),
             })
+        self.fan_source = "redfish"
+        if fans and all(f["reading"] is None for f in fans if f["state"] != "Absent"):
+            web = self._web_fan_speeds()
+            if web:
+                by_label = {str(w.get("label", "")).lower(): w for w in web}
+                for f in fans:
+                    w = by_label.get(f["name"].lower())
+                    if w is None and f["index"] < len(web):
+                        w = web[f["index"]]           # same order as Redfish
+                    if w and isinstance(w.get("speed"), (int, float)):
+                        f["reading"] = w["speed"]
+                self.fan_source = "ilo-web"
         temps: List[Dict[str, Any]] = []
         for t in d.get("Temperatures", []):
             st = t.get("Status") or {}

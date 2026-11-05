@@ -329,7 +329,7 @@ class ServerWorker(threading.Thread):
             "link": {"redfish": self.link, "fails": self.fails, "last_ok": self.last_ok,
                      "last_poll": self.last_poll, "error": self.last_error,
                      "ssh": self.shell.connected, "patched": self.shell.patched,
-                     "ssh_error": self.shell.last_error},
+                     "ssh_error": self.shell.last_error, "fan_source": self.rf.fan_source},
             "thermal": self.thermal, "power": self.power,
             "system": self.system, "manager": self.manager,
             "fan_count": self._fan_count,

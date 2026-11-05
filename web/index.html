@@ -186,7 +186,7 @@
           <div class="card-head">
             <h2>Fans</h2>
             <span class="info" tabindex="0"
-              data-tip="Percentage of full speed. iLO 4 does not report RPM over Redfish.">i</span>
+              data-tip="Percentage of full speed. Read from Redfish, or - when Redfish leaves it out, as on many iLO 4 builds - from the iLO web interface's own Fans page.">i</span>
           </div>
           <div id="sensorFans" class="sensor-grid"></div>
         </div>
@@ -312,7 +312,7 @@
               <button data-pm="target">Adaptive</button>
             </div>
             <span class="info" tabindex="0"
-              data-tip="Fixed curve: the speed comes straight from the points below. Adaptive: you pick a target temperature and the panel finds the quietest speed that holds it, lowering the fans slowly (1% a minute at most) and raising them fast. After a few hours in adaptive mode, Suggest curve turns what it learned into fixed points.">i</span>
+              data-tip="Fixed curve: the speed comes straight from the points below. Adaptive: you pick a target temperature and the panel finds the quietest speed that holds it, lowering the fans slowly (1% a minute at most) and raising them as fast as the temperature trend needs. It remembers the speed it learned across restarts. After a few hours in adaptive mode, Suggest curve turns what it learned into fixed points.">i</span>
             <span class="target-box" id="targetBox" hidden>
               <label>Keep at or below</label>
               <input id="targetC" type="number" min="30" max="95" step="1"><span class="unit">°C</span>
@@ -621,7 +621,9 @@
             <p>در حالت <b>Adaptive</b> به‌جای منحنی ثابت فقط یک <b>دمای هدف</b> می‌دهی، مثلاً «CPU حداکثر ۶۰ درجه». پنل خودش کمترین سرعتی را پیدا می‌کند که دما را زیر هدف نگه دارد، و با تغییر بار یا دمای اتاق خودش را تطبیق می‌دهد.</p>
             <ul>
               <li><b>پایین آمدن آرام است:</b> فقط وقتی دما یک دقیقه‌ی کامل زیر هدف و ثابت مانده باشد، سرعت ۱٪ کم می‌شود. یعنی حداکثر ۱٪ در هر دقیقه. دلیلش این است که گرما دیر در سرور پخش می‌شود. اگر سریع‌تر پایین بیاید، فن‌ها مدام بالا و پایین می‌روند.</li>
-              <li><b>بالا رفتن سریع است:</b> به محض گذشتن از هدف، به نسبت مقداری که بالاتر رفته فوراً تند می‌شود. اگر ۸ درجه از هدف بالاتر برود، مستقیم ۱۰۰٪ می‌شود.</li>
+              <li><b>بالا رفتن با در نظر گرفتن روند دماست:</b> وقتی دما از هدف بالاتر می‌رود، هر ۳۰ ثانیه یک بار تند می‌کند و اندازه‌ی گام را از روی اختلاف دما و سرعت بالا رفتنش حساب می‌کند. اگر دما همین الان در حال پایین آمدن باشد، یعنی تند شدن قبلی دارد اثر می‌کند، دیگر اضافه نمی‌کند. این‌طوری فن‌ها بی‌دلیل خیلی تند نمی‌شوند: در شبیه‌سازی‌ای که ۷ درجه بالاتر از هدف شروع می‌شد، سرعت حداکثر به ۳۶٪ رسید، در حالی که نسخه‌ی قبلی تا ۶۷٪ می‌رفت. اگر دما ۴ درجه یا بیشتر از هدف بالاتر باشد و هنوز رو به بالا برود، در هر poll تند می‌کند. اگر ۸ درجه بالاتر برود، مستقیم ۱۰۰٪ می‌شود.</li>
+              <li><b>زمان واقعی:</b> همه‌ی این زمان‌ها ثانیه‌ی واقعی‌اند، پس فاصله‌ی poll سرور (۱۰ یا ۲۰ ثانیه) رفتار را عوض نمی‌کند.</li>
+              <li><b>یادش می‌ماند:</b> سرعتی که به آن رسیده روی دیسک ذخیره می‌شود. بعد از ری‌استارت سرویس یا نصب نسخه‌ی جدید، از همان‌جا ادامه می‌دهد و لازم نیست از نو یاد بگیرد.</li>
               <li><b>ایمنی:</b> هدف هیچ‌وقت نمی‌تواند به فاصله‌ی کمتر از ۳ درجه از نقطه‌ی قطع Watchdog برسد. اگر هدف را خیلی بالا بگذاری، پنل خودش پایینش می‌آورد و در تب Fans هم نشانش می‌دهد. Watchdog هم مثل قبل فعال است.</li>
               <li><b>نقطه‌های منحنی</b> در این حالت فقط سرعت شروع هستند و کم‌رنگ نمایش داده می‌شوند.</li>
             </ul>

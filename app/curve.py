@@ -39,13 +39,20 @@ RESUME_BELOW_C = 5          # extra degrees under the trip point before resuming
 RESUME_TICKS = 3            # ...held for this many polls in a row
 RESUME_MIN_S = 120          # ...and never sooner than this after the trip
 
-# Adaptive ("target temperature") mode. Heat moves slowly through a chassis,
-# so the fans only come down one step at a time, after the temperature has
-# sat comfortably below target for a full window; they go up straight away.
+# Adaptive ("target temperature") mode. Heat takes minutes to move through a
+# chassis, so a controller that reacts every poll keeps adding speed long
+# after the last increase would have been enough - and then takes ages to
+# come back down. Everything here is in real seconds (not polls, so the
+# server's poll interval doesn't change the behaviour) and looks at the
+# temperature's trend as well as its level.
 DEFAULT_TARGET_C = 65
 TARGET_BELOW_TRIP_C = 3     # a target can never sit closer than this to the watchdog trip
-ADAPT_WINDOW = 6            # polls the temperature must stay low before each step down
+ADAPT_UP_EVERY_S = 30       # normal pace of increases while over target...
+ADAPT_URGENT_C = 4          # ...but every poll when this far over and still climbing
+ADAPT_DOWN_EVERY_S = 60     # the temperature must sit low this long before each step down
 ADAPT_DOWN_STEP = 1.0       # % per step down
+ADAPT_TREND_S = 120         # history used to judge whether it's rising or falling
+ADAPT_FALLING = -0.3        # °C/min: already cooling, the last increase is working
 ADAPT_PANIC_C = 8           # this far over target: 100% at once
 
 
@@ -172,9 +179,12 @@ class CurveEngine:
         self._cool_ticks = 0
         self._lock = threading.RLock()
         # Adaptive mode, per profile: the output it has worked its way to, recent
-        # temperatures, and polls since it last stepped down. Kept across
-        # re-sends, so a reboot doesn't make it relearn from scratch.
+        # (time, temperature) samples, and when it last stepped up or down.
         self.adapt: Dict[str, Dict[str, Any]] = {}
+        # The output itself is also kept on disk, so a service restart (or an
+        # upgrade) carries on from there instead of relearning from the curve.
+        self.learned = JsonStore(server_dir(sid) / "adaptive.json", {})
+        self.clock = time.time                # replaceable in tests
 
     # ------------------------------------------------------------------ #
     def config(self, fan_count: int) -> Dict[str, Any]:
@@ -295,7 +305,7 @@ class CurveEngine:
                 goal = effective_target(prof["target_c"], sensor_limit(temps, name), margin)
                 target = self._adaptive(pid, prof, temp, goal, hyst, up)
             else:
-                self.adapt.pop(pid, None)
+                self._forget_learned(pid)
                 target = int(round(interpolate(prof["points"], temp)))
                 if prev is not None:
                     if seen is not None and abs(temp - seen) < hyst and abs(target - prev) < 5:
@@ -322,30 +332,55 @@ class CurveEngine:
     def _adaptive(self, pid: str, prof: Dict[str, Any], temp: float, goal: float,
                   hyst: float, up: int) -> int:
         """Find the lowest fan speed that holds `temp` at or under `goal`."""
+        now = self.clock()
         a = self.adapt.get(pid)
         if a is None:
-            # Start from what the curve would give, so switching modes isn't a jolt.
-            a = self.adapt[pid] = {"out": float(interpolate(prof["points"], temp)),
-                                   "temps": [], "since_down": 0}
-        a["temps"] = (a["temps"] + [temp])[-ADAPT_WINDOW:]
-        a["since_down"] += 1
+            # Carry on from what it learned before a restart; otherwise start from
+            # what the curve would give, so switching modes isn't a jolt.
+            saved = self.learned.read().get(pid)
+            start = float(saved) if isinstance(saved, (int, float)) else float(interpolate(prof["points"], temp))
+            a = self.adapt[pid] = {"out": start, "hist": [], "last_up": 0.0, "last_down": now}
+        a["hist"] = [(t, v) for t, v in a["hist"] if now - t <= ADAPT_TREND_S] + [(now, temp)]
+        first_t, first_v = a["hist"][0]
+        span = now - first_t
+        slope = (temp - first_v) / (span / 60.0) if span >= 20 else 0.0      # °C per minute
         err = temp - goal
+        band = max(hyst, 1.0)
+
         if err >= ADAPT_PANIC_C:
-            a["out"] = 100.0
+            a["out"], a["last_up"] = 100.0, now
         elif err > 0:
-            # Over target: up right away, harder the further over.
-            a["out"] += min(float(up), max(1.0, err * 2.0))
-            a["since_down"] = 0
-        elif err < -max(hyst, 1.0):
-            recent = a["temps"]
-            settled = (len(recent) >= ADAPT_WINDOW and max(recent) < goal - max(hyst, 1.0)
-                       and recent[-1] <= recent[0] + 0.5)          # not climbing
-            if settled and a["since_down"] >= ADAPT_WINDOW:
+            if slope <= ADAPT_FALLING:
+                pass                    # already cooling: give the last increase time to work
+            elif now - a["last_up"] >= ADAPT_UP_EVERY_S or (err >= ADAPT_URGENT_C and slope > 0):
+                # Size the step by how far over it is and how fast it's still climbing.
+                step = err * 1.5 + max(0.0, slope) * 2.0
+                a["out"] += min(float(up), max(1.0, step))
+                a["last_up"] = now
+            a["last_down"] = now        # no stepping down right after being over
+        elif err < -band:
+            recent = [v for t, v in a["hist"] if now - t <= ADAPT_DOWN_EVERY_S]
+            steady_long_enough = span >= ADAPT_DOWN_EVERY_S * 0.9
+            if (steady_long_enough and max(recent) < goal - band and slope <= 0.2
+                    and now - a["last_down"] >= ADAPT_DOWN_EVERY_S):
                 a["out"] -= ADAPT_DOWN_STEP
-                a["since_down"] = 0
+                a["last_down"] = now
         floor = float(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
         a["out"] = max(floor, min(100.0, a["out"]))
-        return int(round(a["out"]))
+        result = int(round(a["out"]))
+        if a.get("saved") != result:    # remember it across restarts (changes are rare)
+            data = self.learned.read()
+            data[pid] = result
+            self.learned.write(data)
+            a["saved"] = result
+        return result
+
+    def _forget_learned(self, pid: str) -> None:
+        if pid in self.adapt:
+            self.adapt.pop(pid, None)
+            data = self.learned.read()
+            if data.pop(pid, None) is not None:
+                self.learned.write(data)
 
     def status(self, fan_count: int) -> Dict[str, Any]:
         return {
