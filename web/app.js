@@ -922,6 +922,10 @@ function showCurveLive() {
   const box = $("#curveLive"), live = selectedSensor(), st = c.profile_state?.[prof.id];
   const n = fansOf(prof.id).length, fanWord = `${n} fan${n === 1 ? "" : "s"}`, dot = profColor(prof.id);
   if (c.tripped_at) box.innerHTML = `<span class="live-dot"></span>Paused by the watchdog — ${esc(c.trip_reason || "")}`;
+  else if (st?.learning)
+    box.innerHTML = `<span class="live-dot" style="background:var(--uid);box-shadow:0 0 8px var(--uid)"></span>
+      Learning, step <b>${st.learning.step}</b> of ${st.learning.of}: ${fanWord} held at <b>${st.applied}%</b> —
+      ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b>, about ${Math.ceil(st.learning.left_s / 60)} min left`;
   else if (c.config?.enabled && st && st.mode === "target")
     box.innerHTML = `<span class="live-dot" style="background:var(--ok);box-shadow:0 0 8px var(--ok)"></span>
       Adaptive: ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b> (target <b>${Math.round(st.goal)}°</b>)
@@ -1066,14 +1070,51 @@ function renderModeRow() {
   $("#suggestBox").hidden = !sug;
   if (sug) {
     $("#suggestBox").classList.toggle("bad", !!sug.error);
+    const m = sug.model;
     $("#suggestText").textContent = sug.error ||
-      `Built from ${sug.pairs} steady 5-minute periods over the last ${sug.hours} h, seen between ` +
-      `${sug.observed[0]}° and ${sug.observed[1]}°. Green dots are what adaptive mode settled on; the dashed ` +
-      `green line is the suggestion, with a safety climb to 100%` +
-      (sug.trip ? ` before the watchdog trip point (${sug.trip}°).` : ".") +
-      " Applying replaces this curve's points and switches it to Fixed curve.";
+      `Learned from ${sug.pairs} steady 5-minute periods (${sug.hours} h, ${sug.observed[0]}–${sug.observed[1]}°): ` +
+      `how hot this part runs for a given load, room temperature and fan speed — the model predicts it within ` +
+      `±${m.error_c}°C. The dashed green curve is designed so the fans sit as low as they can when it's easy and ` +
+      `reach just enough to hold ${sug.target}° at the highest load and warmest room seen (plus margin)` +
+      (sug.trip ? `, then climb to 100% before the watchdog trip point (${sug.trip}°).` : ".") +
+      (sug.notes?.length ? " " + sug.notes.join(" ") : "");
+    const p = sug.predict;
+    $("#suggestPredict").innerHTML = p ? `
+      <div><span>Typical load</span><b>${p.typical.temp}° at ${p.typical.fan}%</b><small>${p.typical.power} W, room ${p.typical.inlet}°</small></div>
+      <div><span>Peak load</span><b>${p.peak.temp}° at ${p.peak.fan}%</b><small>${p.peak.power} W, room ${p.peak.inlet}°</small></div>` : "";
+    if (document.activeElement !== $("#sugTarget") && sug.target) $("#sugTarget").value = Math.round(sug.target);
   }
+  updateLearnButton();
 }
+function updateLearnButton() {
+  const prof = curProf(); if (!prof) return;
+  const run = curveStatus()?.profile_state?.[prof.id]?.learning;
+  $("#learnBtn").textContent = run ? `Stop learning (${Math.ceil(run.left_s / 60)} min left)` : "Learn (~30 min)";
+  $("#learnBtn").classList.toggle("danger", !!run);
+}
+$("#learnBtn").onclick = guard(async () => {
+  const prof = curProf(); if (!prof) return;
+  if (curveStatus()?.profile_state?.[prof.id]?.learning) {
+    await sapi(`/curve/learn?profile=${encodeURIComponent(prof.id)}`, { method:"DELETE" });
+    return toast("Learning stopped — normal control resumed", "good");
+  }
+  if (!confirm(`Learn how "${prof.name}" responds to airflow?\n\nFor about 30 minutes its fans are held at: normal +20%, ` +
+               `then +10%, then 5% below normal — 10 minutes each. It stops at once if the temperature gets near its ` +
+               `limit, and everything is logged. Afterwards, Suggest curve can design a curve for this server.`)) return;
+  const r = await sapi("/curve/learn", { body:{ profile: prof.id } });
+  toast(`Learning started: ${r.levels.join("%, ")}% for 10 minutes each`, "good");
+});
+async function runSuggest(target) {
+  const prof = curProf(); if (!prof) return;
+  $("#suggestBtn").disabled = true;
+  try {
+    const t = target ? `&target=${encodeURIComponent(target)}` : "";
+    const r = await sapi(`/curve/suggest?profile=${encodeURIComponent(prof.id)}&days=7${t}`);
+    state.suggest = { pid: prof.id, ...r };
+  } finally { $("#suggestBtn").disabled = false; }
+  renderModeRow(); drawCurve();
+}
+$("#sugRecalc").onclick = guard(() => runSuggest(+$("#sugTarget").value || null));
 $("#profMode").onclick = guard(async e => {
   const b = e.target.closest("button[data-pm]"), prof = curProf();
   if (!b || !prof || prof.mode === b.dataset.pm) return;
@@ -1095,15 +1136,7 @@ $("#targetC").onchange = guard(async () => {
   drawCurve();
   if (await saveCurve()) toast(`Target set to ${prof.target_c}°`, "good");
 });
-$("#suggestBtn").onclick = guard(async () => {
-  const prof = curProf(); if (!prof) return;
-  $("#suggestBtn").disabled = true;
-  try {
-    const r = await sapi(`/curve/suggest?profile=${encodeURIComponent(prof.id)}&days=7`);
-    state.suggest = { pid: prof.id, ...r };
-  } finally { $("#suggestBtn").disabled = false; }
-  renderModeRow(); drawCurve();
-});
+$("#suggestBtn").onclick = guard(() => runSuggest(null));
 $("#suggestDiscard").onclick = () => { state.suggest = null; renderModeRow(); drawCurve(); };
 $("#suggestApply").onclick = guard(async () => {
   const prof = curProf(), sug = state.suggest;
@@ -1420,7 +1453,7 @@ function renderAll() {
         $("#curveState").textContent = state.curveCfg?.enabled ? "on" : "off";
         $("#curveState").classList.toggle("on", !!state.curveCfg?.enabled);
         if (!curveDragging) updateCurve();
-        updateProfileLive();
+        updateProfileLive(); updateLearnButton();
       }
       if (!document.activeElement?.matches?.("#fanRows input")) renderFans();
     }

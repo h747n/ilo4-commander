@@ -364,18 +364,51 @@ def curve_get(sid: str) -> Dict[str, Any]:
     return w.curve.status(w.fan_count())
 
 
-@app.get("/api/servers/{sid}/curve/suggest", dependencies=guard)
-def curve_suggest(sid: str, profile: str, days: int = Query(7, ge=1, le=30)) -> Dict[str, Any]:
-    """A fixed curve built from what adaptive mode learned for this profile."""
+@app.post("/api/servers/{sid}/curve/learn", dependencies=guard)
+def curve_learn(sid: str, profile: str = Body(..., embed=True)) -> Dict[str, Any]:
+    """Hold this curve's fans at a few speeds for ~30 min so its behaviour can be measured."""
     w = worker(sid)
-    prof = next((p for p in w.curve.config(w.fan_count())["profiles"] if p["id"] == profile), None)
+    run = w.curve.start_learning(profile, w.fan_count())
+    w.apply_now()
+    return {"ok": True, "levels": run["levels"]}
+
+
+@app.delete("/api/servers/{sid}/curve/learn", dependencies=guard)
+def curve_learn_stop(sid: str, profile: str) -> Dict[str, Any]:
+    w = worker(sid)
+    w.curve.stop_learning(profile)
+    w.apply_now()
+    return {"ok": True}
+
+
+@app.get("/api/servers/{sid}/curve/suggest", dependencies=guard)
+def curve_suggest(sid: str, profile: str, days: int = Query(7, ge=1, le=30),
+                  target: Optional[float] = Query(None, ge=30, le=110)) -> Dict[str, Any]:
+    """Design a fixed curve for this profile from a model of how the server behaves."""
+    w = worker(sid)
+    cfg = w.curve.config(w.fan_count())
+    prof = next((p for p in cfg["profiles"] if p["id"] == profile), None)
     if not prof:
         raise HTTPException(status_code=404, detail="No such curve.")
     temps = (w.thermal or {}).get("temperatures", [])
     name, _ = hot_sensor(temps, prof["sensor"])
-    return suggest(sid, prof["name"], sensor_limit(temps, name),
-                   float(w.cfg.get("watchdog_margin_c", 5)), days,
-                   int(w.cfg.get("min_pwm_percent", 0)))
+    # Which recorded series this curve steers by, and which fans it drives.
+    known = history_db.names(sid).get("temp", [])
+    sel = prof["sensor"]
+    if sel == "__cpu__":
+        sensors = [n for n in known if "cpu" in n.lower() or "proc" in n.lower()]
+    elif sel == "__hottest__":
+        sensors = known
+    else:
+        sensors = [n for n in known if n.lower() == sel.lower()] or \
+                  [n for n in known if sel.lower() in n.lower()]
+    fans_live = (w.thermal or {}).get("fans", [])
+    fan_names = [fans_live[int(i)]["name"] for i, p in cfg["assign"].items()
+                 if p == profile and int(i) < len(fans_live)]
+    if target is None and prof.get("mode") == "target":
+        target = prof["target_c"]
+    return suggest(sid, sensors, fan_names, prof["name"], target, sensor_limit(temps, name),
+                   float(w.cfg.get("watchdog_margin_c", 5)), int(w.cfg.get("min_pwm_percent", 0)), days)
 
 
 @app.put("/api/servers/{sid}/curve", dependencies=guard)

@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict
 
-VERSION = "3.0.10"
+VERSION = "3.0.11"
 
 DATA_DIR = Path(os.environ.get("ILO_DATA_DIR", "./data")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)

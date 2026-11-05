@@ -318,12 +318,18 @@
               <input id="targetC" type="number" min="30" max="95" step="1"><span class="unit">°C</span>
             </span>
             <span class="spacer"></span>
+            <button id="learnBtn" class="ghost"
+              data-tip="Holds this curve's fans at a few known speeds (+20%, +10%, then 5% below normal), 10 minutes each, to measure how much airflow matters here. Stops at once if the temperature gets near its limit. Needed once before Suggest curve can design anything.">Learn (~30 min)</button>
             <button id="suggestBtn" class="ghost"
-              data-tip="Build a fixed curve from what adaptive mode learned on this server over the last week.">Suggest curve</button>
+              data-tip="Designs a fixed curve from a model of how this part heats up with load, room temperature and fan speed, learned from the last week of history.">Suggest curve</button>
           </div>
           <div class="suggest-box" id="suggestBox" hidden>
             <p id="suggestText"></p>
-            <div class="row">
+            <div class="sug-predict" id="suggestPredict"></div>
+            <div class="row wrap">
+              <label>Design for at most</label>
+              <input id="sugTarget" type="number" min="30" max="110" step="1"><span class="unit">°C</span>
+              <button class="ghost" id="sugRecalc">Recalculate</button>
               <span class="spacer"></span>
               <button class="ghost" id="suggestDiscard">Discard</button>
               <button class="primary" id="suggestApply">Apply as fixed curve</button>
@@ -627,7 +633,9 @@
               <li><b>ایمنی:</b> هدف هیچ‌وقت نمی‌تواند به فاصله‌ی کمتر از ۳ درجه از نقطه‌ی قطع Watchdog برسد. اگر هدف را خیلی بالا بگذاری، پنل خودش پایینش می‌آورد و در تب Fans هم نشانش می‌دهد. Watchdog هم مثل قبل فعال است.</li>
               <li><b>نقطه‌های منحنی</b> در این حالت فقط سرعت شروع هستند و کم‌رنگ نمایش داده می‌شوند.</li>
             </ul>
-            <p><b>Suggest curve:</b> بعد از چند ساعت کار در حالت Adaptive (بهتر از آن، یک روز کامل که زمان شلوغی را هم شامل شود)، این دکمه از چیزهایی که پنل یاد گرفته یک منحنی ثابت می‌سازد. نقطه‌های سبز سرعت‌هایی‌اند که در هر دما کافی بوده‌اند و خط‌چین سبز منحنی پیشنهادی است. منحنی محافظه‌کارانه است: صدک ۸۰ را در نظر می‌گیرد نه کمترین مقدار، با بالا رفتن دما هیچ‌وقت پایین نمی‌آید، و بالاتر از بیشترین دمایی که دیده، یک شیب تند تا ۱۰۰٪ اضافه می‌کند. تا وقتی <b>Apply</b> نزنی چیزی عوض نمی‌شود.</p>
+            <p><b>Suggest curve</b> منحنی را از روی داده‌ها <i>طراحی</i> می‌کند، نه اینکه کپی کند. از تاریخچه‌ی یک هفته‌ی اخیر یک مدل ساده یاد می‌گیرد که نشان می‌دهد این قطعه با چه بار (توان مصرفی)، چه دمای اتاق و چه سرعت فنی چقدر گرم می‌شود. با همین مدل منحنی‌ای می‌سازد که در شرایط آسان فن‌ها روی کمترین سرعت بمانند، و در بیشترین باری که دیده با گرم‌ترین دمای اتاق (به‌اضافه‌ی کمی حاشیه) فقط همان‌قدر تند شوند که دما زیر هدف بماند. بالای هدف هم یک شیب تند تا ۱۰۰٪ دارد که قبل از نقطه‌ی قطع Watchdog تمام می‌شود. کنار منحنی پیشنهادی <b>پیش‌بینی</b> هم نشان داده می‌شود، مثلاً «در بار معمولی روی ۸۴ درجه با ۱۷٪ می‌ماند»، به‌همراه اینکه مدل با چه خطایی دما را پیش‌بینی می‌کند. با «Design for at most» دمای هدف را عوض کن و دوباره محاسبه کن. تا وقتی <b>Apply</b> نزنی چیزی عوض نمی‌شود.</p>
+            <p><b>Learn:</b> مدل فقط وقتی قابل یادگیری است که سرعت فن در تاریخچه تغییر کرده باشد. اگر فن‌ها همیشه روی یک سرعت بوده‌اند، دکمه‌ی <b>Learn</b> را بزن. حدود ۳۰ دقیقه فن‌های آن منحنی را در سه مرحله‌ی ۱۰ دقیقه‌ای نگه می‌دارد: ۲۰٪ بالاتر از حالت عادی، ۱۰٪ بالاتر، و ۵٪ پایین‌تر. اگر دما به حد ایمنی برسد (دمای هدف، یا ۵ درجه زیر نقطه‌ی قطع Watchdog)، فوراً متوقف می‌شود و کنترل عادی برمی‌گردد. Watchdog هم Learn را متوقف می‌کند. همه‌ی مراحل در Activity ثبت می‌شوند.</p>
+            <p><b>محدودیت:</b> سنسور CPU در iLO 4 وقتی پردازنده خنک‌تر از ۴۰ درجه باشد همیشه عدد ۴۰ را نشان می‌دهد. برای منحنی‌هایی که فقط به CPU نگاه می‌کنند، تا وقتی سرور زیر بار واقعی نرود چیزی برای یاد گرفتن نیست. پنل این را صریح می‌گوید و منحنی بی‌پایه پیشنهاد نمی‌دهد.</p>
             <p><b>کدام بهتر است؟</b> Adaptive کمترین صدای ممکن را می‌دهد، ولی سرعت فن آرام‌آرام عوض می‌شود. منحنی ثابتی که از آن ساخته می‌شود صدای یکنواخت‌تری دارد. روال پیشنهادی این است که یک روز روی Adaptive بماند، بعد Suggest curve بزنی و پیشنهاد را اعمال کنی.</p></details>
           <details class="guide"><summary>Hysteresis و Ramp را چند بگذارم؟</summary>
             <p><b>Hysteresis</b> بین ۲ تا ۳ درجه جلوی بالا و پایین رفتن مداوم فن‌ها را وقتی دما حول یک عدد نوسان می‌کند می‌گیرد. <b>Ramp up</b> را بزرگ نگه دار (۱۰ تا ۲۰) تا در برابر گرما سریع واکنش نشان دهد. <b>Ramp down</b> را کوچک بگذار (۳ تا ۵) تا بعد از یک بار کوتاه، فن‌ها آرام پایین بیایند و صدا مدام عوض نشود. فاصله‌ی نمونه‌برداری را در تنظیمات هر سرور تعیین می‌کنی (پیش‌فرض ۱۰ ثانیه).</p></details>

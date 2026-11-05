@@ -55,6 +55,14 @@ ADAPT_TREND_S = 120         # history used to judge whether it's rising or falli
 ADAPT_FALLING = -0.3        # °C/min: already cooling, the last increase is working
 ADAPT_PANIC_C = 8           # this far over target: 100% at once
 
+# "Learn": hold a curve's fans at a few known speeds so the curve designer can
+# see how much airflow matters. Up first (only ever more cooling), then one
+# step below normal - the useful bit for quietness - under a temperature guard.
+LEARN_STEP_S = 600          # time at each speed; long enough to settle (~5 time constants)
+LEARN_UP = (20, 10)         # % above the normal output
+LEARN_DOWN = 5              # % below it for the last step
+LEARN_GUARD_BELOW_TRIP = 5  # stop the moment the sensor gets this close to the watchdog trip
+
 
 def normalize(cfg: Dict[str, Any], fan_count: int = 6) -> Dict[str, Any]:
     """Return a config that is always safe to iterate over.
@@ -185,6 +193,7 @@ class CurveEngine:
         # upgrade) carries on from there instead of relearning from the curve.
         self.learned = JsonStore(server_dir(sid) / "adaptive.json", {})
         self.clock = time.time                # replaceable in tests
+        self.learning: Dict[str, Dict[str, Any]] = {}   # profile id -> Learn run in progress
 
     # ------------------------------------------------------------------ #
     def config(self, fan_count: int) -> Dict[str, Any]:
@@ -195,6 +204,11 @@ class CurveEngine:
         clean = normalize(merged, fan_count)
         self.store.write(clean)
         self.reset_applied()
+        ids = {p["id"] for p in clean["profiles"]}
+        for pid in list(self.learning):
+            if not clean["enabled"] or pid not in ids:
+                self.learning.pop(pid, None)
+                self.log("tune", "Learning stopped: the curve was switched off or removed.")
         return clean
 
     def reset_applied(self) -> None:
@@ -233,6 +247,9 @@ class CurveEngine:
             if hottest_gap <= 0 and managed:
                 name, val, kind, limit = culprit
                 self.tripped_at = time.time()
+                if self.learning:
+                    self.learning.clear()
+                    self.log("tune", "Learning stopped: the watchdog took over.")
                 self.trip_reason = (f"{name} reached {val}°C — trip point {limit - margin:g}°C "
                                     f"({kind} {limit:g}°C minus {margin:g}°C margin)")
                 others = [o for o in over if not o.startswith(f"{name} ")]
@@ -262,6 +279,63 @@ class CurveEngine:
             self.reset_applied()
             self.log("watchdog", f"Cooled down after {mins} min (closest now: {name} {val}°C, "
                                  f"trip point {limit - margin:g}°C) — curve control resumed.")
+
+    # ------------------------------------------------------------------ #
+    def start_learning(self, pid: str, fan_count: int) -> Dict[str, Any]:
+        with self._lock:
+            cfg = self.config(fan_count)
+            prof = next((p for p in cfg["profiles"] if p["id"] == pid), None)
+            if not prof:
+                raise ValueError("No such curve.")
+            if not cfg["enabled"] or self.tripped:
+                raise ValueError("Switch the automatic curve on first (and wait until the watchdog isn't active).")
+            base = self.applied.get(pid)
+            if base is None:
+                raise ValueError("Let this curve run for a poll or two first.")
+            floor = int(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
+            levels: List[int] = []
+            for v in [min(100, base + u) for u in LEARN_UP] + [max(floor, base - LEARN_DOWN)]:
+                if v != base and v not in levels:
+                    levels.append(v)
+            if not levels:
+                raise ValueError("This curve is already at 100%; there's nothing to vary.")
+            now = self.clock()
+            self.learning[pid] = {"levels": levels, "i": 0, "base": base, "step_started": now}
+            self.log("tune", f"Learning started for '{prof['name']}': fans held at "
+                             f"{', '.join(f'{v}%' for v in levels)} for {LEARN_STEP_S // 60} minutes each "
+                             f"(normal output {base}%).")
+            return self.learning[pid]
+
+    def stop_learning(self, pid: str, reason: str = "stopped by hand") -> None:
+        with self._lock:
+            if self.learning.pop(pid, None) is not None:
+                self.reset_applied()
+                self.log("tune", f"Learning {reason}.")
+
+    def _learn_level(self, pid: str, prof: Dict[str, Any], sensor: Optional[str], temp: float,
+                     temps: List[Dict[str, Any]], goal: Optional[float]) -> Optional[int]:
+        """The speed a Learn run wants right now, or None when there's no run."""
+        run = self.learning.get(pid)
+        if not run:
+            return None
+        margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
+        limit = sensor_limit(temps, sensor)
+        guard = min(x for x in (goal, (limit - margin - LEARN_GUARD_BELOW_TRIP) if limit else None,
+                                 1e9) if x is not None)
+        if temp >= guard:
+            self.learning.pop(pid, None)
+            self.log("tune", f"Learning for '{prof['name']}' stopped early: {sensor} reached {temp:g}°C "
+                             f"(the test's limit is {guard:g}°C). Normal control resumed.")
+            return None
+        now = self.clock()
+        if now - run["step_started"] >= LEARN_STEP_S:
+            run["i"] += 1
+            run["step_started"] = now
+        if run["i"] >= len(run["levels"]):
+            self.learning.pop(pid, None)
+            self.log("tune", f"Learning for '{prof['name']}' finished — Suggest curve can use it now.")
+            return None
+        return run["levels"][run["i"]]
 
     def clear_trip(self) -> None:
         if self.tripped:
@@ -303,7 +377,12 @@ class CurveEngine:
             if prof.get("mode") == "target":
                 margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
                 goal = effective_target(prof["target_c"], sensor_limit(temps, name), margin)
-                target = self._adaptive(pid, prof, temp, goal, hyst, up)
+            learn = self._learn_level(pid, prof, name, temp, temps, goal)
+            if prof.get("mode") == "target":
+                if learn is None:
+                    target = self._adaptive(pid, prof, temp, goal, hyst, up)
+                else:   # hold what it had learned while the test runs
+                    target = int(round(self.adapt.get(pid, {}).get("out", learn)))
             else:
                 self._forget_learned(pid)
                 target = int(round(interpolate(prof["points"], temp)))
@@ -311,6 +390,10 @@ class CurveEngine:
                     if seen is not None and abs(temp - seen) < hyst and abs(target - prev) < 5:
                         target = prev
                     target = min(prev + up, max(prev - down, target))
+            if learn is not None:
+                base = self.learning[pid]["base"]
+                # Steps above normal never cool *less* than normal control would.
+                target = max(learn, target) if learn >= base else learn
             # Report what actually reaches the fans: set_pwm never goes below the floor.
             clamp = getattr(self.fans, "_clamp", None)
             if clamp:
@@ -326,6 +409,12 @@ class CurveEngine:
                          "applied": target, "fans": sorted(fan_list),
                          "mode": prof.get("mode", "curve"),
                          "goal": round(goal, 1) if goal is not None else None}
+            run = self.learning.get(pid)
+            if run:
+                live[pid]["learning"] = {
+                    "step": run["i"] + 1, "of": len(run["levels"]), "level": run["levels"][run["i"]],
+                    "left_s": int(max(0, LEARN_STEP_S - (self.clock() - run["step_started"])
+                                      + LEARN_STEP_S * (len(run["levels"]) - run["i"] - 1)))}
         self.profile_state = live
         self.last_error = None
 
