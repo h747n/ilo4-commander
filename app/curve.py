@@ -39,6 +39,15 @@ RESUME_BELOW_C = 5          # extra degrees under the trip point before resuming
 RESUME_TICKS = 3            # ...held for this many polls in a row
 RESUME_MIN_S = 120          # ...and never sooner than this after the trip
 
+# Adaptive ("target temperature") mode. Heat moves slowly through a chassis,
+# so the fans only come down one step at a time, after the temperature has
+# sat comfortably below target for a full window; they go up straight away.
+DEFAULT_TARGET_C = 65
+TARGET_BELOW_TRIP_C = 3     # a target can never sit closer than this to the watchdog trip
+ADAPT_WINDOW = 6            # polls the temperature must stay low before each step down
+ADAPT_DOWN_STEP = 1.0       # % per step down
+ADAPT_PANIC_C = 8           # this far over target: 100% at once
+
 
 def normalize(cfg: Dict[str, Any], fan_count: int = 6) -> Dict[str, Any]:
     """Return a config that is always safe to iterate over.
@@ -72,8 +81,14 @@ def normalize(cfg: Dict[str, Any], fan_count: int = 6) -> Dict[str, Any]:
         pts.sort(key=lambda q: q[0])
         if len(pts) < 2:
             pts = [list(q) for q in DEFAULT_POINTS]
+        try:
+            target_c = int(prof.get("target_c", DEFAULT_TARGET_C))
+        except (TypeError, ValueError):
+            target_c = DEFAULT_TARGET_C
         clean.append({"id": pid, "name": str(prof.get("name") or pid),
-                      "sensor": str(prof.get("sensor") or "__cpu__"), "points": pts})
+                      "sensor": str(prof.get("sensor") or "__cpu__"), "points": pts,
+                      "mode": "target" if prof.get("mode") == "target" else "curve",
+                      "target_c": max(30, min(95, target_c))})
     out["profiles"] = clean
 
     ids = {p["id"] for p in clean}
@@ -125,6 +140,22 @@ def hot_sensor(temps: List[Dict[str, Any]], wanted: str) -> Tuple[Optional[str],
     return hit if hit[1] is not None else pick(lambda n: wanted.lower() in n.lower())
 
 
+def sensor_limit(temps: List[Dict[str, Any]], name: Optional[str]) -> Optional[float]:
+    """The threshold the watchdog uses for this sensor: caution, else critical."""
+    for t in temps:
+        if t.get("name") == name:
+            lim = t.get("caution") or t.get("critical")
+            return float(lim) if isinstance(lim, (int, float)) and lim else None
+    return None
+
+
+def effective_target(target_c: float, limit: Optional[float], margin: float) -> float:
+    """The user's target, but never closer than TARGET_BELOW_TRIP_C to the trip point."""
+    if limit is None:
+        return float(target_c)
+    return min(float(target_c), limit - margin - TARGET_BELOW_TRIP_C)
+
+
 class CurveEngine:
     def __init__(self, sid: str, fans, log) -> None:
         self.store = JsonStore(server_dir(sid) / "curve.json", DEFAULT_CURVE)
@@ -140,6 +171,10 @@ class CurveEngine:
         self.trip_reason: Optional[str] = None
         self._cool_ticks = 0
         self._lock = threading.RLock()
+        # Adaptive mode, per profile: the output it has worked its way to, recent
+        # temperatures, and polls since it last stepped down. Kept across
+        # re-sends, so a reboot doesn't make it relearn from scratch.
+        self.adapt: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     def config(self, fan_count: int) -> Dict[str, Any]:
@@ -253,12 +288,19 @@ class CurveEngine:
                 name, temp = hot_sensor(temps, "__hottest__")
             if temp is None:
                 continue
-            target = int(round(interpolate(prof["points"], temp)))
             prev, seen = self.applied.get(pid), self.temps_seen.get(pid)
-            if prev is not None:
-                if seen is not None and abs(temp - seen) < hyst and abs(target - prev) < 5:
-                    target = prev
-                target = min(prev + up, max(prev - down, target))
+            goal = None
+            if prof.get("mode") == "target":
+                margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
+                goal = effective_target(prof["target_c"], sensor_limit(temps, name), margin)
+                target = self._adaptive(pid, prof, temp, goal, hyst, up)
+            else:
+                self.adapt.pop(pid, None)
+                target = int(round(interpolate(prof["points"], temp)))
+                if prev is not None:
+                    if seen is not None and abs(temp - seen) < hyst and abs(target - prev) < 5:
+                        target = prev
+                    target = min(prev + up, max(prev - down, target))
             # Report what actually reaches the fans: set_pwm never goes below the floor.
             clamp = getattr(self.fans, "_clamp", None)
             if clamp:
@@ -271,9 +313,39 @@ class CurveEngine:
             if prev is None or target != prev:
                 self.temps_seen[pid] = temp
             live[pid] = {"name": prof["name"], "sensor": name, "temp": round(temp, 1),
-                         "applied": target, "fans": sorted(fan_list)}
+                         "applied": target, "fans": sorted(fan_list),
+                         "mode": prof.get("mode", "curve"),
+                         "goal": round(goal, 1) if goal is not None else None}
         self.profile_state = live
         self.last_error = None
+
+    def _adaptive(self, pid: str, prof: Dict[str, Any], temp: float, goal: float,
+                  hyst: float, up: int) -> int:
+        """Find the lowest fan speed that holds `temp` at or under `goal`."""
+        a = self.adapt.get(pid)
+        if a is None:
+            # Start from what the curve would give, so switching modes isn't a jolt.
+            a = self.adapt[pid] = {"out": float(interpolate(prof["points"], temp)),
+                                   "temps": [], "since_down": 0}
+        a["temps"] = (a["temps"] + [temp])[-ADAPT_WINDOW:]
+        a["since_down"] += 1
+        err = temp - goal
+        if err >= ADAPT_PANIC_C:
+            a["out"] = 100.0
+        elif err > 0:
+            # Over target: up right away, harder the further over.
+            a["out"] += min(float(up), max(1.0, err * 2.0))
+            a["since_down"] = 0
+        elif err < -max(hyst, 1.0):
+            recent = a["temps"]
+            settled = (len(recent) >= ADAPT_WINDOW and max(recent) < goal - max(hyst, 1.0)
+                       and recent[-1] <= recent[0] + 0.5)          # not climbing
+            if settled and a["since_down"] >= ADAPT_WINDOW:
+                a["out"] -= ADAPT_DOWN_STEP
+                a["since_down"] = 0
+        floor = float(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
+        a["out"] = max(floor, min(100.0, a["out"]))
+        return int(round(a["out"]))
 
     def status(self, fan_count: int) -> Dict[str, Any]:
         return {

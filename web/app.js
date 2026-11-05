@@ -290,8 +290,9 @@ function renderBanner() {
     const running = profs.filter(p => live[p.id]);
     if (profs.length <= 1) {
       const st = live[profs[0]?.id];
-      title = "Automatic curve is running";
-      note = st ? `${st.sensor || "sensor"} at ${Math.round(st.temp)}° → ceiling ${st.applied}%.`
+      title = st?.mode === "target" ? "Adaptive control is running" : "Automatic curve is running";
+      note = st?.mode === "target" ? `${st.sensor || "sensor"} at ${Math.round(st.temp)}° (target ${Math.round(st.goal)}°) → ${st.applied}%.`
+           : st ? `${st.sensor || "sensor"} at ${Math.round(st.temp)}° → ceiling ${st.applied}%.`
                 : s.system?.power_state && s.system.power_state !== "On" ? "Waiting for the host to power on."
                 : "Waiting for the first cycle.";
     } else if (running.length) {
@@ -760,10 +761,28 @@ function drawCurve() {
     mk(svg, "path", { d: pts.map((q, i) => `${i ? "L" : "M"}${CX(q[0]).toFixed(1)},${CY(q[1]).toFixed(1)}`).join(""),
       fill:"none", stroke:profColor(o.id), "stroke-width":"1.4", "stroke-dasharray":"5 4", opacity:".35" });
   });
+  // Adaptive mode: the target line, what it has learned, and any suggestion.
+  if (prof.mode === "target") {
+    const goal = curveStatus()?.profile_state?.[prof.id]?.goal ?? prof.target_c;
+    const gx = CX(Math.max(CV.tmin, Math.min(CV.tmax, goal)));
+    mk(svg, "line", { x1:gx, y1:CV.t, x2:gx, y2:CV.h - CV.b, stroke:"#2FC08B", "stroke-width":"1.5", "stroke-dasharray":"6 3" });
+    mk(svg, "text", { x:gx - 5, y:CV.t + 26, fill:"#2FC08B", "font-size":"10.5", "text-anchor":"end",
+      "font-family":"monospace" }, `target ${Math.round(goal)}°`);
+  }
+  const sug = state.suggest?.pid === prof.id ? state.suggest : null;
+  (sug?.samples || []).forEach(p => mk(svg, "circle", {
+    cx:CX(Math.max(CV.tmin, Math.min(CV.tmax, p.t))), cy:CY(p.p), r:2, fill:"#2FC08B", opacity:".35" }));
+  if (sug?.points) {
+    mk(svg, "path", { d: sug.points.map((q, i) => `${i ? "L" : "M"}${CX(q[0]).toFixed(1)},${CY(q[1]).toFixed(1)}`).join(""),
+      fill:"none", stroke:"#2FC08B", "stroke-width":"2.2", "stroke-dasharray":"7 4" });
+    sug.points.forEach(q => mk(svg, "circle", { cx:CX(q[0]), cy:CY(q[1]), r:3.5, fill:"#2FC08B" }));
+  }
   const accent = profColor(prof.id);
-  CE.area   = mk(svg, "path", { fill:accent, opacity:".11", stroke:"none" });
+  // In adaptive mode the points are only the starting speed, so play them down.
+  const dim = prof.mode === "target" ? ".35" : "1";
+  CE.area   = mk(svg, "path", { fill:accent, opacity: prof.mode === "target" ? ".04" : ".11", stroke:"none" });
   CE.ext    = mk(svg, "path", { fill:"none", stroke:accent, "stroke-width":"1.4", "stroke-dasharray":"3 4", opacity:".55" });
-  CE.line   = mk(svg, "path", { fill:"none", stroke:accent, "stroke-width":"2.2", "stroke-linejoin":"round", "stroke-linecap":"round" });
+  CE.line   = mk(svg, "path", { fill:"none", stroke:accent, "stroke-width":"2.2", "stroke-linejoin":"round", "stroke-linecap":"round", opacity:dim });
   CE.hover  = mk(svg, "g", { opacity:"0" });
   CE.marker = mk(svg, "g", {});
   CE.nodes = prof.points.map(p => {
@@ -851,7 +870,8 @@ function updateCurve() {
   const nowTemp = c?.config?.enabled && st ? st.temp : live?.reading;
   if (nowTemp != null) {
     const x = CX(Math.max(CV.tmin, Math.min(CV.tmax, nowTemp)));
-    const wanted = Math.round(effective(prof.points, nowTemp));
+    // Adaptive mode has no curve value: show the speed it actually chose.
+    const wanted = prof.mode === "target" && st ? st.applied : Math.round(effective(prof.points, nowTemp));
     const left = x < CV.w / 2;
     mk(CE.marker, "line", { x1:x, y1:CV.t, x2:x, y2:CV.h - CV.b, stroke:"#F2A93B", "stroke-dasharray":"3 3" });
     mk(CE.marker, "circle", { cx:x, cy:CY(wanted), r:6, fill:"#10141B", stroke:"#F2A93B", "stroke-width":"2.2" });
@@ -902,9 +922,16 @@ function showCurveLive() {
   const box = $("#curveLive"), live = selectedSensor(), st = c.profile_state?.[prof.id];
   const n = fansOf(prof.id).length, fanWord = `${n} fan${n === 1 ? "" : "s"}`, dot = profColor(prof.id);
   if (c.tripped_at) box.innerHTML = `<span class="live-dot"></span>Paused by the watchdog — ${esc(c.trip_reason || "")}`;
+  else if (c.config?.enabled && st && st.mode === "target")
+    box.innerHTML = `<span class="live-dot" style="background:var(--ok);box-shadow:0 0 8px var(--ok)"></span>
+      Adaptive: ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b> (target <b>${Math.round(st.goal)}°</b>)
+      → ${fanWord} at <b>${st.applied}%</b>` +
+      (st.goal < prof.target_c ? ` <span class="live-err">target capped at ${Math.round(st.goal)}° to stay clear of the watchdog</span>` : "");
   else if (c.config?.enabled && st)
     box.innerHTML = `<span class="live-dot" style="background:${dot};box-shadow:0 0 8px ${dot}"></span>
       ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b> → ${fanWord} capped at <b>${st.applied}%</b>`;
+  else if (live && prof.mode === "target")
+    box.innerHTML = `<span class="live-dot idle"></span>${esc(live.name)} is at <b>${live.reading}°</b> — adaptive mode will hold it at or below <b>${prof.target_c}°</b>`;
   else if (live)
     box.innerHTML = `<span class="live-dot idle"></span>${esc(live.name)} is at <b>${live.reading}°</b> — this curve would give <b>${Math.round(effective(prof.points, live.reading))}%</b> to ${fanWord}`;
   else box.textContent = c.config?.enabled ? "Enabled — waiting for the first cycle." : `Off. Would drive ${fanWord}.`;
@@ -1000,6 +1027,7 @@ function renderCurveUI() {
   $("#curveDown").value = cfg.ramp_down_step;
   $("#curveResume").checked = cfg.watchdog_auto_resume !== false;
   $("#profName").value = curProf()?.name || "";
+  renderModeRow();
   if (document.activeElement !== $("#minPwm")) $("#minPwm").value = floorPct();
   minPwmHint();
   fillSensorSelect(); renderProfileBar(); renderAssignChips(); renderPtEditor(); fitCurve();
@@ -1024,6 +1052,70 @@ const saveCurve = guard(async () => {
   renderBanner(); updateProfileLive(); renderRail();
   return true;
 });
+/* ---- adaptive mode and curve suggestion ---- */
+function renderModeRow() {
+  const prof = curProf(); if (!prof) return;
+  const adaptive = prof.mode === "target";
+  $$("#profMode button").forEach(b => b.classList.toggle("on", b.dataset.pm === (prof.mode || "curve")));
+  $("#targetBox").hidden = !adaptive;
+  if (document.activeElement !== $("#targetC")) $("#targetC").value = prof.target_c ?? 65;
+  $("#curveHint").textContent = adaptive
+    ? "Adaptive mode: the points are only where it starts. The dashed green line is the target; the fans settle on the quietest speed that holds it."
+    : "Drag a point to reshape the curve, or tap one to type exact numbers. Double-click (double-tap) empty space to add a point.";
+  const sug = state.suggest?.pid === prof.id ? state.suggest : null;
+  $("#suggestBox").hidden = !sug;
+  if (sug) {
+    $("#suggestBox").classList.toggle("bad", !!sug.error);
+    $("#suggestText").textContent = sug.error ||
+      `Built from ${sug.pairs} steady 5-minute periods over the last ${sug.hours} h, seen between ` +
+      `${sug.observed[0]}° and ${sug.observed[1]}°. Green dots are what adaptive mode settled on; the dashed ` +
+      `green line is the suggestion, with a safety climb to 100%` +
+      (sug.trip ? ` before the watchdog trip point (${sug.trip}°).` : ".") +
+      " Applying replaces this curve's points and switches it to Fixed curve.";
+  }
+}
+$("#profMode").onclick = guard(async e => {
+  const b = e.target.closest("button[data-pm]"), prof = curProf();
+  if (!b || !prof || prof.mode === b.dataset.pm) return;
+  prof.mode = b.dataset.pm;
+  if (prof.mode === "target") {
+    // Start just above where this sensor is now, so switching causes no jolt
+    // (an HD controller at 87° with a 65° target would go straight to 100%).
+    const now = selectedSensor()?.reading;
+    prof.target_c = Math.max(30, Math.min(95, now != null ? Math.round(now) + 3 : (prof.target_c || 65)));
+  }
+  renderModeRow(); drawCurve();
+  if (await saveCurve())
+    toast(prof.mode === "target" ? `Adaptive: keeping ${prof.name} at or below ${prof.target_c}°` : "Back to the fixed curve", "good");
+});
+$("#targetC").onchange = guard(async () => {
+  const prof = curProf(); if (!prof) return;
+  prof.target_c = Math.max(30, Math.min(95, Math.round(+$("#targetC").value || 65)));
+  $("#targetC").value = prof.target_c;
+  drawCurve();
+  if (await saveCurve()) toast(`Target set to ${prof.target_c}°`, "good");
+});
+$("#suggestBtn").onclick = guard(async () => {
+  const prof = curProf(); if (!prof) return;
+  $("#suggestBtn").disabled = true;
+  try {
+    const r = await sapi(`/curve/suggest?profile=${encodeURIComponent(prof.id)}&days=7`);
+    state.suggest = { pid: prof.id, ...r };
+  } finally { $("#suggestBtn").disabled = false; }
+  renderModeRow(); drawCurve();
+});
+$("#suggestDiscard").onclick = () => { state.suggest = null; renderModeRow(); drawCurve(); };
+$("#suggestApply").onclick = guard(async () => {
+  const prof = curProf(), sug = state.suggest;
+  if (!prof || !sug?.points || sug.pid !== prof.id) return;
+  if (!confirm(`Replace the points of "${prof.name}" with the suggested curve and switch it to Fixed curve?`)) return;
+  prof.points = sug.points.map(p => p.slice());
+  prof.mode = "curve";
+  state.suggest = null; selPoint = null;
+  renderModeRow(); drawCurve(); renderPtEditor();
+  if (await saveCurve()) toast("Suggested curve applied", "good");
+});
+
 function minPwmHint() {
   const v = +$("#minPwm").value;
   $("#minPwmHint").textContent = v < 5 ? "Below 5% some fans stall and iLO reports a fan fault."
@@ -1297,7 +1389,7 @@ async function refreshSnapshot() {
 }
 function selectServer(id) {
   state.current = id; store.set("ilo.server", id || "");
-  state.recent = []; state.recentFor = null; state.curveFor = null; state.curveCfg = null;
+  state.recent = []; state.recentFor = null; state.curveFor = null; state.curveCfg = null; state.suggest = null;
   $("#cage").innerHTML = "";
   if (!id) { renderAll(); return; }
   adoptCurve(true);

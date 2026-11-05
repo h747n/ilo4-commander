@@ -306,6 +306,9 @@ class ServerWorker(threading.Thread):
             rows.append(("power", "system", watts))
         for st in self.curve.profile_state.values():
             rows.append(("target", st["name"], st["applied"]))
+            # The temperature each curve was steering by: paired with "target"
+            # above, this is what the curve suggestion learns from.
+            rows.append(("drive", st["name"], st["temp"]))
         try:
             history_db.record(self.sid, now, rows)
         except Exception:      # noqa: BLE001 - history is best-effort

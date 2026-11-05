@@ -26,6 +26,8 @@ from .redfish import Redfish, RedfishError
 from .servers import (CONNECTION_KEYS, FIELDS, ServerError, connection_changed,
                       public, registry)
 from .ssh_client import IloShell, IloSshError
+from .curve import hot_sensor, sensor_limit
+from .tuner import suggest
 from .worker import ServerWorker, fleet
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -360,6 +362,20 @@ def presets_apply(sid: str, name: str = Body(...), mode: str = Body("max")) -> D
 def curve_get(sid: str) -> Dict[str, Any]:
     w = worker(sid)
     return w.curve.status(w.fan_count())
+
+
+@app.get("/api/servers/{sid}/curve/suggest", dependencies=guard)
+def curve_suggest(sid: str, profile: str, days: int = Query(7, ge=1, le=30)) -> Dict[str, Any]:
+    """A fixed curve built from what adaptive mode learned for this profile."""
+    w = worker(sid)
+    prof = next((p for p in w.curve.config(w.fan_count())["profiles"] if p["id"] == profile), None)
+    if not prof:
+        raise HTTPException(status_code=404, detail="No such curve.")
+    temps = (w.thermal or {}).get("temperatures", [])
+    name, _ = hot_sensor(temps, prof["sensor"])
+    return suggest(sid, prof["name"], sensor_limit(temps, name),
+                   float(w.cfg.get("watchdog_margin_c", 5)), days,
+                   int(w.cfg.get("min_pwm_percent", 0)))
 
 
 @app.put("/api/servers/{sid}/curve", dependencies=guard)

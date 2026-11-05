@@ -306,6 +306,31 @@
           </div>
 
           <div class="row wrap assign-row">
+            <label>Mode</label>
+            <div class="seg" id="profMode">
+              <button data-pm="curve" class="on">Fixed curve</button>
+              <button data-pm="target">Adaptive</button>
+            </div>
+            <span class="info" tabindex="0"
+              data-tip="Fixed curve: the speed comes straight from the points below. Adaptive: you pick a target temperature and the panel finds the quietest speed that holds it, lowering the fans slowly (1% a minute at most) and raising them fast. After a few hours in adaptive mode, Suggest curve turns what it learned into fixed points.">i</span>
+            <span class="target-box" id="targetBox" hidden>
+              <label>Keep at or below</label>
+              <input id="targetC" type="number" min="30" max="95" step="1"><span class="unit">°C</span>
+            </span>
+            <span class="spacer"></span>
+            <button id="suggestBtn" class="ghost"
+              data-tip="Build a fixed curve from what adaptive mode learned on this server over the last week.">Suggest curve</button>
+          </div>
+          <div class="suggest-box" id="suggestBox" hidden>
+            <p id="suggestText"></p>
+            <div class="row">
+              <span class="spacer"></span>
+              <button class="ghost" id="suggestDiscard">Discard</button>
+              <button class="primary" id="suggestApply">Apply as fixed curve</button>
+            </div>
+          </div>
+
+          <div class="row wrap assign-row">
             <label>Minimum fan speed</label>
             <input id="minPwm" type="number" min="0" max="60" step="1"><span class="unit">%</span>
             <button id="minPwmSave" class="ghost">Save</button>
@@ -592,6 +617,16 @@
               <li><b>ناحیه‌ی امن (۷۵ درجه به بالا):</b> شیب تند تا ۱۰۰٪. این بخش را هیچ‌وقت صاف نکن.</li>
             </ul>
             <p>برای فن‌های جلو که هوای دیسک‌ها را تأمین می‌کنند، می‌توانی یک منحنی جدا بسازی که حسگر «HD Max» یا «Inlet» را دنبال کند.</p></details>
+          <details class="guide"><summary>حالت Adaptive و «Suggest curve» چطور کار می‌کنند؟</summary>
+            <p>در حالت <b>Adaptive</b> به‌جای منحنی ثابت فقط یک <b>دمای هدف</b> می‌دهی، مثلاً «CPU حداکثر ۶۰ درجه». پنل خودش کمترین سرعتی را پیدا می‌کند که دما را زیر هدف نگه دارد، و با تغییر بار یا دمای اتاق خودش را تطبیق می‌دهد.</p>
+            <ul>
+              <li><b>پایین آمدن آرام است:</b> فقط وقتی دما یک دقیقه‌ی کامل زیر هدف و ثابت مانده باشد، سرعت ۱٪ کم می‌شود. یعنی حداکثر ۱٪ در هر دقیقه. دلیلش این است که گرما دیر در سرور پخش می‌شود. اگر سریع‌تر پایین بیاید، فن‌ها مدام بالا و پایین می‌روند.</li>
+              <li><b>بالا رفتن سریع است:</b> به محض گذشتن از هدف، به نسبت مقداری که بالاتر رفته فوراً تند می‌شود. اگر ۸ درجه از هدف بالاتر برود، مستقیم ۱۰۰٪ می‌شود.</li>
+              <li><b>ایمنی:</b> هدف هیچ‌وقت نمی‌تواند به فاصله‌ی کمتر از ۳ درجه از نقطه‌ی قطع Watchdog برسد. اگر هدف را خیلی بالا بگذاری، پنل خودش پایینش می‌آورد و در تب Fans هم نشانش می‌دهد. Watchdog هم مثل قبل فعال است.</li>
+              <li><b>نقطه‌های منحنی</b> در این حالت فقط سرعت شروع هستند و کم‌رنگ نمایش داده می‌شوند.</li>
+            </ul>
+            <p><b>Suggest curve:</b> بعد از چند ساعت کار در حالت Adaptive (بهتر از آن، یک روز کامل که زمان شلوغی را هم شامل شود)، این دکمه از چیزهایی که پنل یاد گرفته یک منحنی ثابت می‌سازد. نقطه‌های سبز سرعت‌هایی‌اند که در هر دما کافی بوده‌اند و خط‌چین سبز منحنی پیشنهادی است. منحنی محافظه‌کارانه است: صدک ۸۰ را در نظر می‌گیرد نه کمترین مقدار، با بالا رفتن دما هیچ‌وقت پایین نمی‌آید، و بالاتر از بیشترین دمایی که دیده، یک شیب تند تا ۱۰۰٪ اضافه می‌کند. تا وقتی <b>Apply</b> نزنی چیزی عوض نمی‌شود.</p>
+            <p><b>کدام بهتر است؟</b> Adaptive کمترین صدای ممکن را می‌دهد، ولی سرعت فن آرام‌آرام عوض می‌شود. منحنی ثابتی که از آن ساخته می‌شود صدای یکنواخت‌تری دارد. روال پیشنهادی این است که یک روز روی Adaptive بماند، بعد Suggest curve بزنی و پیشنهاد را اعمال کنی.</p></details>
           <details class="guide"><summary>Hysteresis و Ramp را چند بگذارم؟</summary>
             <p><b>Hysteresis</b> بین ۲ تا ۳ درجه جلوی بالا و پایین رفتن مداوم فن‌ها را وقتی دما حول یک عدد نوسان می‌کند می‌گیرد. <b>Ramp up</b> را بزرگ نگه دار (۱۰ تا ۲۰) تا در برابر گرما سریع واکنش نشان دهد. <b>Ramp down</b> را کوچک بگذار (۳ تا ۵) تا بعد از یک بار کوتاه، فن‌ها آرام پایین بیایند و صدا مدام عوض نشود. فاصله‌ی نمونه‌برداری را در تنظیمات هر سرور تعیین می‌کنی (پیش‌فرض ۱۰ ثانیه).</p></details>
           <details class="guide"><summary>Ceiling، Floor و Lock چه فرقی دارند؟</summary>

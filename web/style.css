@@ -557,3 +557,12 @@ details.guide b{color:var(--ink)}
   .seg button,.chip{font-size:12.5px}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ---------- adaptive mode + curve suggestion ---------- */
+.target-box{display:inline-flex;align-items:center;gap:.5rem}
+.target-box label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);white-space:nowrap}
+.suggest-box{margin-top:.65rem;padding:.65rem .8rem;border:1px solid rgba(47,192,139,.45);
+  background:rgba(47,192,139,.07);border-radius:var(--rs);font-size:12.5px}
+.suggest-box p{margin:0 0 .5rem;color:var(--dim)}
+.suggest-box.bad{border-color:rgba(242,169,59,.45);background:rgba(242,169,59,.07)}
+.suggest-box.bad .row{display:none}
