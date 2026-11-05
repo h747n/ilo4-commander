@@ -225,7 +225,7 @@ function renderFleet() {
     const snap = state.snaps[cfg.id], hot = hottestOf(snap);
     const c = el("button", "fleet-card" + (cfg.id === state.current ? " on" : ""));
     const applied = Object.values(snap?.curve?.fan_applied || {});
-    const fanPct = applied.length ? Math.max(...applied) + "%" : fanModeOf(snap);
+    const fanPct = applied.length && !snap?.curve?.tripped_at ? Math.max(...applied) + "%" : ({ "watchdog":"iLO", "iLO auto":"iLO" }[fanModeOf(snap)] || fanModeOf(snap));
     const l = snap?.link?.redfish, ps = snap?.system?.power_state;
     const badge = !cfg.enabled ? `<span class="badge">paused</span>`
       : l === "down" ? `<span class="badge bad">offline</span>`

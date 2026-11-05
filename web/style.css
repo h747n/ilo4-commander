@@ -216,20 +216,21 @@ output.muted{color:var(--faint)}
 
 /* ---------- fleet strip ---------- */
 .fleet{display:grid;gap:.6rem;grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
-.fleet-card{display:grid;gap:.35rem;text-align:left;padding:.7rem .8rem;background:var(--surface);
+.fleet-card{display:grid;min-width:0;overflow:hidden;gap:.35rem;text-align:left;padding:.7rem .8rem;background:var(--surface);
   border:1px solid var(--line-soft);border-radius:var(--r);cursor:pointer;white-space:normal}
 .fleet-card:hover{border-color:var(--line)}
 .fleet-card.on{border-color:rgba(76,141,255,.55);background:rgba(76,141,255,.07)}
 .fleet-card .fc-top{display:flex;align-items:center;gap:.5rem;min-width:0}
-.fleet-card .fc-name{font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fleet-card .fc-name{flex:1;min-width:0;font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fleet-card .fc-row{display:flex;gap:.8rem;font-family:var(--mono);font-size:11px;color:var(--dim)}
 .fleet-card .fc-row b{font-weight:400;color:var(--ink)}
 .fleet-card .fc-model{font-family:var(--mono);font-size:10px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.fleet-card .fc-big{display:flex;align-items:baseline;gap:.9rem;font-family:var(--mono);font-variant-numeric:tabular-nums}
-.fleet-card .fc-big b{font-size:18px;font-weight:500;color:var(--ink)}
+.fleet-card .fc-big{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.6rem;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.fleet-card .fc-big>div{min-width:0}
+.fleet-card .fc-big b{display:block;font-size:18px;font-weight:500;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fleet-card .fc-big b.caution{color:var(--caution)} .fleet-card .fc-big b.critical{color:var(--crit)}
 .fleet-card .fc-big span{font-size:10px;color:var(--faint);display:block;letter-spacing:.08em;text-transform:uppercase}
-.badge{font-family:var(--mono);font-size:9.5px;border-radius:3px;padding:0 .35rem;border:1px solid var(--line);color:var(--dim);margin-left:auto}
+.badge{flex:none;white-space:nowrap;font-family:var(--mono);font-size:9.5px;border-radius:3px;padding:0 .35rem;border:1px solid var(--line);color:var(--dim);margin-left:auto}
 .badge.warn{color:var(--caution);border-color:rgba(242,169,59,.5)} .badge.bad{color:var(--crit);border-color:rgba(240,85,90,.5)}
 
 /* ---------- fan cage ---------- */
@@ -532,6 +533,7 @@ details.guide b{color:var(--ink)}
   .track{height:150px}
   .slot{min-width:40px}
   .fleet{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  .fleet-card .fc-big b{font-size:15px}
   .fan-row{grid-template-columns:3.6rem 1fr 3rem;row-gap:.3rem}
   .fan-row .fr-rpm{display:none}
   .fan-row button{grid-column:1/-1}
