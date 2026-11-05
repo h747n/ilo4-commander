@@ -313,15 +313,15 @@
             </div>
             <span class="info" tabindex="0"
               data-tip="Fixed curve: the speed comes straight from the points below. Adaptive: you pick a target temperature and the panel finds the quietest speed that holds it, lowering the fans slowly (1% a minute at most) and raising them as fast as the temperature trend needs. It remembers the speed it learned across restarts. After a few hours in adaptive mode, Suggest curve turns what it learned into fixed points.">i</span>
-            <span class="target-box" id="targetBox" hidden>
-              <label>Keep at or below</label>
+            <span class="target-box" id="targetBox">
+              <label id="targetLabel">Max temperature</label>
               <input id="targetC" type="number" min="30" max="95" step="1"><span class="unit">°C</span>
             </span>
             <span class="spacer"></span>
             <button id="learnBtn" class="ghost"
-              data-tip="Holds this curve's fans at a few known speeds (+20%, +10%, then 5% below normal), 10 minutes each, to measure how much airflow matters here. Stops at once if the temperature gets near its limit. Needed once before Suggest curve can design anything.">Learn (~30 min)</button>
+              data-tip="Holds this curve's fans at a few known speeds (+20%, +10%, then 5% below normal), each until the temperature settles (10–30 minutes), to measure how much airflow matters here. Stops at once if the temperature gets near its limit. Needed once before Suggest curve can design anything.">Learn (30–90 min)</button>
             <button id="suggestBtn" class="ghost"
-              data-tip="Designs a fixed curve from a model of how this part heats up with load, room temperature and fan speed, learned from the last week of history.">Suggest curve</button>
+              data-tip="Designs a fixed curve from a model of how this part heats up with load, room temperature and fan speed, learned from up to 30 days of history (refreshed every 20 minutes).">Suggest curve</button>
           </div>
           <div class="suggest-box" id="suggestBox" hidden>
             <p id="suggestText"></p>
@@ -332,7 +332,8 @@
               <button class="ghost" id="sugRecalc">Recalculate</button>
               <span class="spacer"></span>
               <button class="ghost" id="suggestDiscard">Discard</button>
-              <button class="primary" id="suggestApply">Apply as fixed curve</button>
+              <button class="ghost" id="suggestApply">Apply as fixed curve</button>
+              <button class="primary" id="suggestAdaptive" hidden>Use adaptive</button>
             </div>
           </div>
 
@@ -346,6 +347,7 @@
           </div>
 
           <div class="curve-live" id="curveLive"></div>
+          <div class="model-line" id="modelLine"></div>
           <svg id="curveEditor" class="curve-editor"></svg>
 
           <div class="pt-editor" id="ptEditor" hidden>
@@ -633,10 +635,22 @@
               <li><b>ایمنی:</b> هدف هیچ‌وقت نمی‌تواند به فاصله‌ی کمتر از ۳ درجه از نقطه‌ی قطع Watchdog برسد. اگر هدف را خیلی بالا بگذاری، پنل خودش پایینش می‌آورد و در تب Fans هم نشانش می‌دهد. Watchdog هم مثل قبل فعال است.</li>
               <li><b>نقطه‌های منحنی</b> در این حالت فقط سرعت شروع هستند و کم‌رنگ نمایش داده می‌شوند.</li>
             </ul>
-            <p><b>Suggest curve</b> منحنی را از روی داده‌ها <i>طراحی</i> می‌کند، نه اینکه کپی کند. از تاریخچه‌ی یک هفته‌ی اخیر یک مدل ساده یاد می‌گیرد که نشان می‌دهد این قطعه با چه بار (توان مصرفی)، چه دمای اتاق و چه سرعت فنی چقدر گرم می‌شود. با همین مدل منحنی‌ای می‌سازد که در شرایط آسان فن‌ها روی کمترین سرعت بمانند، و در بیشترین باری که دیده با گرم‌ترین دمای اتاق (به‌اضافه‌ی کمی حاشیه) فقط همان‌قدر تند شوند که دما زیر هدف بماند. بالای هدف هم یک شیب تند تا ۱۰۰٪ دارد که قبل از نقطه‌ی قطع Watchdog تمام می‌شود. کنار منحنی پیشنهادی <b>پیش‌بینی</b> هم نشان داده می‌شود، مثلاً «در بار معمولی روی ۸۴ درجه با ۱۷٪ می‌ماند»، به‌همراه اینکه مدل با چه خطایی دما را پیش‌بینی می‌کند. با «Design for at most» دمای هدف را عوض کن و دوباره محاسبه کن. تا وقتی <b>Apply</b> نزنی چیزی عوض نمی‌شود.</p>
-            <p><b>Learn:</b> مدل فقط وقتی قابل یادگیری است که سرعت فن در تاریخچه تغییر کرده باشد. اگر فن‌ها همیشه روی یک سرعت بوده‌اند، دکمه‌ی <b>Learn</b> را بزن. حدود ۳۰ دقیقه فن‌های آن منحنی را در سه مرحله‌ی ۱۰ دقیقه‌ای نگه می‌دارد: ۲۰٪ بالاتر از حالت عادی، ۱۰٪ بالاتر، و ۵٪ پایین‌تر. اگر دما به حد ایمنی برسد (دمای هدف، یا ۵ درجه زیر نقطه‌ی قطع Watchdog)، فوراً متوقف می‌شود و کنترل عادی برمی‌گردد. Watchdog هم Learn را متوقف می‌کند. همه‌ی مراحل در Activity ثبت می‌شوند.</p>
+            <p><b>Suggest curve</b> منحنی را از روی داده‌ها <i>طراحی</i> می‌کند، نه اینکه کپی کند. از کل تاریخچه (تا ۳۰ روز) یک مدل ساده یاد می‌گیرد که نشان می‌دهد این قطعه با چه بار (توان مصرفی)، چه دمای اتاق و چه سرعت فنی چقدر گرم می‌شود. با همین مدل منحنی‌ای می‌سازد که در شرایط آسان فن‌ها روی کمترین سرعت بمانند، و در بیشترین باری که دیده با گرم‌ترین دمای اتاق (به‌اضافه‌ی کمی حاشیه) فقط همان‌قدر تند شوند که دما زیر هدف بماند. بالای هدف هم یک شیب تند تا ۱۰۰٪ دارد که قبل از نقطه‌ی قطع Watchdog تمام می‌شود. کنار منحنی پیشنهادی <b>پیش‌بینی</b> هم نشان داده می‌شود، مثلاً «در بار معمولی روی ۸۴ درجه با ۱۷٪ می‌ماند»، به‌همراه اینکه مدل با چه خطایی دما را پیش‌بینی می‌کند. با «Design for at most» دمای هدف را عوض کن و دوباره محاسبه کن. تا وقتی <b>Apply</b> نزنی چیزی عوض نمی‌شود.</p>
+            <p><b>منحنی ثابت یا Adaptive؟</b> پنل همیشه هر دو را برای همان شرایط پیش‌بینی می‌کند و اگر Adaptive کم‌صداتر باشد، همان را پیشنهاد می‌دهد (دکمه‌ی <b>Use adaptive</b>). این به‌خصوص برای قطعه‌ای پیش می‌آید که فن روی آن اثر کمی دارد، مثل HD Controller در DL380p که بیشتر هوایش را از فن‌های دیگر می‌گیرد. چنین قطعه‌ای با یک منحنی ثابت که در روز گرم هم امن باشد، در روزهای معمولی بی‌دلیل پرصداست. ولی Adaptive در هر لحظه فقط همان سرعتی را می‌دهد که لازم است (مثلاً ۲۰٪ به‌جای ۳۳٪) و فقط وقتی شرایط واقعاً سخت شد تندتر می‌شود.</p>
+            <p><b>Learn:</b> مدل فقط وقتی قابل یادگیری است که سرعت فن در تاریخچه تغییر کرده باشد. اگر فن‌ها همیشه روی یک سرعت بوده‌اند، دکمه‌ی <b>Learn</b> را بزن. فن‌های آن منحنی را در سه مرحله نگه می‌دارد؛ هر مرحله آن‌قدر طول می‌کشد که دما ثابت شود (۱۰ تا ۳۰ دقیقه، در کل ۳۰ تا ۹۰ دقیقه)، چون هیت‌سینک‌های بزرگ دیر گرم و سرد می‌شوند و مدل باید دمای نهایی را ببیند: ۲۰٪ بالاتر از حالت عادی، ۱۰٪ بالاتر، و ۵٪ پایین‌تر. اگر دما به حد ایمنی برسد (دمای هدف، یا ۵ درجه زیر نقطه‌ی قطع Watchdog)، فوراً متوقف می‌شود و کنترل عادی برمی‌گردد. Watchdog هم Learn را متوقف می‌کند. همه‌ی مراحل در Activity ثبت می‌شوند.</p>
             <p><b>محدودیت:</b> سنسور CPU در iLO 4 وقتی پردازنده خنک‌تر از ۴۰ درجه باشد همیشه عدد ۴۰ را نشان می‌دهد. برای منحنی‌هایی که فقط به CPU نگاه می‌کنند، تا وقتی سرور زیر بار واقعی نرود چیزی برای یاد گرفتن نیست. پنل این را صریح می‌گوید و منحنی بی‌پایه پیشنهاد نمی‌دهد.</p>
             <p><b>کدام بهتر است؟</b> Adaptive کمترین صدای ممکن را می‌دهد، ولی سرعت فن آرام‌آرام عوض می‌شود. منحنی ثابتی که از آن ساخته می‌شود صدای یکنواخت‌تری دارد. روال پیشنهادی این است که یک روز روی Adaptive بماند، بعد Suggest curve بزنی و پیشنهاد را اعمال کنی.</p></details>
+          <details class="guide"><summary>پنل چطور مدام یاد می‌گیرد و هوشمندتر می‌شود؟</summary>
+            <p>برای هر منحنی یک <b>مدل</b> وجود دارد که نشان می‌دهد آن قطعه با چه بار (توان مصرفی)، چه <b>دمای اتاق</b> (Inlet) و چه سرعت فنی چقدر گرم می‌شود. این مدل <b>هر ۲۰ دقیقه</b> خودکار از <b>کل داده‌های ذخیره‌شده</b> (تا ۳۰ روز) به‌اضافه‌ی داده‌های لحظه‌ای از نو ساخته می‌شود. یعنی هر روز که می‌گذرد دقیق‌تر می‌شود و بعد از ری‌استارت هم از دست نمی‌رود.</p>
+            <ul>
+              <li><b>ارزیابی صادقانه:</b> مدل از ۸۰٪ قدیمی‌تر داده‌ها یاد می‌گیرد و روی ۲۰٪ جدیدتر، که هنوز ندیده، امتحان می‌شود. عدد «±… درجه» زیر منحنی همین خطای واقعی است. اگر خطا بیشتر از ۱٫۵ درجه باشد، حالت Adaptive به مدل تکیه نمی‌کند.</li>
+              <li><b>حداکثر دما:</b> هدف همه چیز این است: <b>کمترین صدا، بدون اینکه دما از حداکثری که تعیین کرده‌ای بالاتر برود.</b> حالت Adaptive دما را زیر همین عدد نگه می‌دارد و منحنی پیشنهادی هم آرام‌ترین منحنی‌ای است که زیر همین عدد بماند.</li>
+              <li><b>Adaptive پیش‌بین:</b> با مدل خوب، Adaptive از روی بار و <b>دمای اتاق همین لحظه</b> حساب می‌کند چقدر فن لازم است و مستقیم به همان می‌رود، به‌جای اینکه کورکورانه جست‌وجو کند. اگر اتاق گرم‌تر شود، سرعت <b>پیش از</b> اینکه قطعه داغ شود بالا می‌رود. در شبیه‌سازی، نسخه‌ی قبلی بعد از یک ساعت هنوز روی ۱۵٪ بود، ولی نسخه‌ی پیش‌بین از همان ابتدا به ۸٪ (آرام‌ترین سرعت مجاز) رسید.</li>
+              <li><b>اصلاح زنده:</b> اگر امروز شرایط کمی با میانگین هفته فرق کند، مثلاً گردوغبار بیشتر شده، پنل اختلاف پیش‌بینی با واقعیت را آرام‌آرام یاد می‌گیرد و جبران می‌کند (حداکثر ۳ درجه).</li>
+              <li><b>پیش‌بینی برای اتاق گرم:</b> زیر هر منحنی نوشته می‌شود اگر اتاق ۵ درجه گرم‌تر شود چقدر فن لازم است. در منحنی پیشنهادی هم سناریوی «Hot room» نشان داده می‌شود.</li>
+              <li><b>تشخیص مشکل:</b> اگر قطعه‌ای ۱۰ دقیقه پشت سر هم حداقل ۴ درجه داغ‌تر از چیزی باشد که مدل برای آن بار و سرعت فن انتظار دارد، در Activity هشدار ثبت می‌شود. معمولاً نشانه‌ی گردوغبار، فن ضعیف یا مسیر هوای بسته است.</li>
+              <li><b>منحنی آرام‌تر آماده:</b> اگر مدل منحنی‌ای پیدا کند که از منحنی فعلی‌ات آرام‌تر است، زیر منحنی خبر می‌دهد. تا Apply نزنی، چیزی عوض نمی‌شود.</li>
+            </ul></details>
           <details class="guide"><summary>Hysteresis و Ramp را چند بگذارم؟</summary>
             <p><b>Hysteresis</b> بین ۲ تا ۳ درجه جلوی بالا و پایین رفتن مداوم فن‌ها را وقتی دما حول یک عدد نوسان می‌کند می‌گیرد. <b>Ramp up</b> را بزرگ نگه دار (۱۰ تا ۲۰) تا در برابر گرما سریع واکنش نشان دهد. <b>Ramp down</b> را کوچک بگذار (۳ تا ۵) تا بعد از یک بار کوتاه، فن‌ها آرام پایین بیایند و صدا مدام عوض نشود. فاصله‌ی نمونه‌برداری را در تنظیمات هر سرور تعیین می‌کنی (پیش‌فرض ۱۰ ثانیه).</p></details>
           <details class="guide"><summary>Ceiling، Floor و Lock چه فرقی دارند؟</summary>

@@ -26,9 +26,12 @@ from .redfish import Redfish, RedfishError
 from .servers import (CONNECTION_KEYS, FIELDS, ServerError, connection_changed,
                       public, registry)
 from .ssh_client import IloShell, IloSshError
-from .curve import hot_sensor, sensor_limit
+
 from .tuner import suggest
 from .worker import ServerWorker, fleet
+from .learner import Learner
+
+learner = Learner(fleet)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 mimetypes.add_type("application/manifest+json", ".webmanifest")
@@ -37,10 +40,12 @@ mimetypes.add_type("application/manifest+json", ".webmanifest")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     fleet.start_all()
+    learner.start()
     maintenance.start()
     influx.start()
     yield
     fleet.stop_all()
+    learner.stop()
     maintenance.stop()
     influx.stop()
 
@@ -382,33 +387,25 @@ def curve_learn_stop(sid: str, profile: str) -> Dict[str, Any]:
 
 
 @app.get("/api/servers/{sid}/curve/suggest", dependencies=guard)
-def curve_suggest(sid: str, profile: str, days: int = Query(7, ge=1, le=30),
+def curve_suggest(sid: str, profile: str, days: int = Query(30, ge=1, le=30),
                   target: Optional[float] = Query(None, ge=30, le=110)) -> Dict[str, Any]:
     """Design a fixed curve for this profile from a model of how the server behaves."""
     w = worker(sid)
-    cfg = w.curve.config(w.fan_count())
-    prof = next((p for p in cfg["profiles"] if p["id"] == profile), None)
-    if not prof:
+    inp = w.profile_inputs(profile)
+    if not inp:
         raise HTTPException(status_code=404, detail="No such curve.")
-    temps = (w.thermal or {}).get("temperatures", [])
-    name, _ = hot_sensor(temps, prof["sensor"])
-    # Which recorded series this curve steers by, and which fans it drives.
-    known = history_db.names(sid).get("temp", [])
-    sel = prof["sensor"]
-    if sel == "__cpu__":
-        sensors = [n for n in known if "cpu" in n.lower() or "proc" in n.lower()]
-    elif sel == "__hottest__":
-        sensors = known
-    else:
-        sensors = [n for n in known if n.lower() == sel.lower()] or \
-                  [n for n in known if sel.lower() in n.lower()]
-    fans_live = (w.thermal or {}).get("fans", [])
-    fan_names = [fans_live[int(i)]["name"] for i, p in cfg["assign"].items()
-                 if p == profile and int(i) < len(fans_live)]
-    if target is None and prof.get("mode") == "target":
+    prof = inp["prof"]
+    if target is None and (prof.get("mode") == "target" or prof.get("target_set")):
         target = prof["target_c"]
-    return suggest(sid, sensors, fan_names, prof["name"], target, sensor_limit(temps, name),
-                   float(w.cfg.get("watchdog_margin_c", 5)), int(w.cfg.get("min_pwm_percent", 0)), days)
+    return suggest(sid, inp["sensors"], inp["fans"], prof["name"], target, inp["limit"],
+                   inp["margin"], inp["floor"], days, current=prof["points"])
+
+
+@app.post("/api/servers/{sid}/curve/relearn", dependencies=guard)
+def curve_relearn(sid: str) -> Dict[str, Any]:
+    """Refit this server's models within the next minute instead of waiting."""
+    worker(sid).curve.relearn_wanted = True
+    return {"ok": True}
 
 
 @app.put("/api/servers/{sid}/curve", dependencies=guard)

@@ -58,7 +58,10 @@ ADAPT_PANIC_C = 8           # this far over target: 100% at once
 # "Learn": hold a curve's fans at a few known speeds so the curve designer can
 # see how much airflow matters. Up first (only ever more cooling), then one
 # step below normal - the useful bit for quietness - under a temperature guard.
-LEARN_STEP_S = 600          # time at each speed; long enough to settle (~5 time constants)
+LEARN_STEP_S = 600          # minimum time at each speed ...
+LEARN_SETTLED_S = 480       # ... then move on once the temperature held within 1°C this long
+LEARN_MAX_STEP_S = 1800     # ... or after this, settled or not (big heatsinks are slow:
+                            # a DL360 HD controller was still climbing 66->84° after 10 min)
 LEARN_UP = (20, 10)         # % above the normal output
 LEARN_DOWN = 5              # % below it for the last step
 LEARN_GUARD_BELOW_TRIP = 5  # stop the moment the sensor gets this close to the watchdog trip
@@ -103,7 +106,10 @@ def normalize(cfg: Dict[str, Any], fan_count: int = 6) -> Dict[str, Any]:
         clean.append({"id": pid, "name": str(prof.get("name") or pid),
                       "sensor": str(prof.get("sensor") or "__cpu__"), "points": pts,
                       "mode": "target" if prof.get("mode") == "target" else "curve",
-                      "target_c": max(30, min(95, target_c))})
+                      "target_c": max(30, min(95, target_c)),
+                      # True once the user picked a maximum themselves; until then the
+                      # designer and the mode switch choose a sensible one.
+                      "target_set": bool(prof.get("target_set"))})
     out["profiles"] = clean
 
     ids = {p["id"] for p in clean}
@@ -194,6 +200,19 @@ class CurveEngine:
         self.learned = JsonStore(server_dir(sid) / "adaptive.json", {})
         self.clock = time.time                # replaceable in tests
         self.learning: Dict[str, Dict[str, Any]] = {}   # profile id -> Learn run in progress
+        self.fan_actual: Dict[int, float] = {}           # real speed per fan, set by the worker
+        # What the learner (learner.py) has worked out for each curve, kept on disk
+        # so it's there straight after a restart; plus the live inputs it needs.
+        self.models_store = JsonStore(server_dir(sid) / "models.json", {})
+        self.models: Dict[str, Dict[str, Any]] = self.models_store.read()
+        self.live: Dict[str, float] = {}                 # power (W) and inlet (°C), set by the worker
+        self.bias: Dict[str, float] = {}                 # live correction of each model, °C
+        self.track: Dict[str, List[Tuple[float, float, float]]] = {}   # (time, temp, model error)
+        self.anomaly_at: Dict[str, float] = {}
+        self.relearn_wanted = False                      # ask the learner to refit soon
+        # Floors a Learn run has set, kept on disk: if the service stops mid-run,
+        # the first poll after it starts again clears them.
+        self.fan_floor: Dict[int, int] = {int(k): v for k, v in self.learned.read().get("_floors", {}).items()}
 
     # ------------------------------------------------------------------ #
     def config(self, fan_count: int) -> Dict[str, Any]:
@@ -292,6 +311,13 @@ class CurveEngine:
             base = self.applied.get(pid)
             if base is None:
                 raise ValueError("Let this curve run for a poll or two first.")
+            # Start from what the fans really do: under a ceiling iLO often runs
+            # them far lower (23% under a 54% ceiling), and +20% on the ceiling
+            # would mean a needless jump to 74%.
+            mine = [int(f) for f, p in cfg["assign"].items() if p == pid]
+            real = [self.fan_actual[f] for f in mine if isinstance(self.fan_actual.get(f), (int, float))]
+            if real:
+                base = int(round(min(base, sum(real) / len(real))))
             floor = int(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
             levels: List[int] = []
             for v in [min(100, base + u) for u in LEARN_UP] + [max(floor, base - LEARN_DOWN)]:
@@ -300,10 +326,10 @@ class CurveEngine:
             if not levels:
                 raise ValueError("This curve is already at 100%; there's nothing to vary.")
             now = self.clock()
-            self.learning[pid] = {"levels": levels, "i": 0, "base": base, "step_started": now}
+            self.learning[pid] = {"levels": levels, "i": 0, "base": base, "step_started": now, "recent": []}
             self.log("tune", f"Learning started for '{prof['name']}': fans held at "
-                             f"{', '.join(f'{v}%' for v in levels)} for {LEARN_STEP_S // 60} minutes each "
-                             f"(normal output {base}%).")
+                             f"{', '.join(f'{v}%' for v in levels)}, each until the temperature settles "
+                             f"({LEARN_STEP_S // 60}-{LEARN_MAX_STEP_S // 60} min) (normal output {base}%).")
             return self.learning[pid]
 
     def stop_learning(self, pid: str, reason: str = "stopped by hand") -> None:
@@ -320,7 +346,12 @@ class CurveEngine:
             return None
         margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
         limit = sensor_limit(temps, sensor)
-        guard = min(x for x in (goal, (limit - margin - LEARN_GUARD_BELOW_TRIP) if limit else None,
+        # Steps above normal only add cooling, so only the hard safety limit applies
+        # (a curve sitting right at its adaptive target must not stop the test).
+        # The step below normal also stops a few degrees over the target.
+        down_step = run["levels"][min(run["i"], len(run["levels"]) - 1)] < run["base"]
+        guard = min(x for x in ((limit - margin - LEARN_GUARD_BELOW_TRIP) if limit else None,
+                                 (goal + 3) if (goal is not None and down_step) else None,
                                  1e9) if x is not None)
         if temp >= guard:
             self.learning.pop(pid, None)
@@ -328,12 +359,21 @@ class CurveEngine:
                              f"(the test's limit is {guard:g}°C). Normal control resumed.")
             return None
         now = self.clock()
-        if now - run["step_started"] >= LEARN_STEP_S:
+        recent = run.setdefault("recent", [])
+        recent.append((now, temp))
+        while recent and now - recent[0][0] > LEARN_SETTLED_S:
+            recent.pop(0)
+        held = now - run["step_started"]
+        settled = (held >= LEARN_STEP_S and recent and now - recent[0][0] >= LEARN_SETTLED_S - 15
+                   and max(t for _, t in recent) - min(t for _, t in recent) <= 1.0)
+        if settled or held >= LEARN_MAX_STEP_S:
             run["i"] += 1
             run["step_started"] = now
+            recent.clear()
         if run["i"] >= len(run["levels"]):
             self.learning.pop(pid, None)
-            self.log("tune", f"Learning for '{prof['name']}' finished — Suggest curve can use it now.")
+            self.log("tune", f"Learning for '{prof['name']}' finished — the model is being updated with it now.")
+            self.relearn_wanted = True
             return None
         return run["levels"][run["i"]]
 
@@ -378,9 +418,24 @@ class CurveEngine:
                 margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
                 goal = effective_target(prof["target_c"], sensor_limit(temps, name), margin)
             learn = self._learn_level(pid, prof, name, temp, temps, goal)
+            obs = self._observe(pid, prof, temp, fan_list)
+            f_pred = None
+            m = self.usable_model(pid)
+            if prof.get("mode") == "target" and m and m.get("quality") == "good":
+                from .tuner import needed_fan
+                # Aim a little under the target so the feedback loop has room.
+                f_pred = needed_fan(m, self.live.get("power", 0.0), self.live["inlet"],
+                                    goal - max(hyst, 1.0) / 2, self.bias.get(pid, 0.0))
+            hot_room = None
+            ceiling_c = goal if goal is not None else (prof["target_c"] if prof.get("target_set") else None)
+            if m and ceiling_c is not None:
+                from .tuner import needed_fan
+                warm = self.live["inlet"] + 5
+                need = needed_fan(m, self.live.get("power", 0.0), warm, ceiling_c, self.bias.get(pid, 0.0))
+                hot_room = {"inlet": round(warm, 1), "fan": round(min(need, 999.0), 1)}
             if prof.get("mode") == "target":
                 if learn is None:
-                    target = self._adaptive(pid, prof, temp, goal, hyst, up)
+                    target = self._adaptive(pid, prof, temp, goal, hyst, up, f_pred)
                 else:   # hold what it had learned while the test runs
                     target = int(round(self.adapt.get(pid, {}).get("out", learn)))
             else:
@@ -391,43 +446,72 @@ class CurveEngine:
                         target = prev
                     target = min(prev + up, max(prev - down, target))
             if learn is not None:
-                base = self.learning[pid]["base"]
-                # Steps above normal never cool *less* than normal control would.
-                target = max(learn, target) if learn >= base else learn
+                # Exactly the step's speed: comparing with the normal output would
+                # compare against a ceiling iLO may not even be using (54% ceiling,
+                # 23% real). The temperature guard is what keeps a step safe.
+                target = learn
             # Report what actually reaches the fans: set_pwm never goes below the floor.
             clamp = getattr(self.fans, "_clamp", None)
             if clamp:
                 target = clamp(target)
+            # A ceiling only stops iLO going faster; on these iLOs it often runs well
+            # below it. A Learn step that adds airflow therefore also sets a floor,
+            # so the fans really turn at that speed; the floor goes once it's over.
+            want_floor = learn is not None and learn >= self.learning[pid]["base"]
             for fan in sorted(fan_list):
                 if self.fan_applied.get(fan) != target:
                     self.fans.set_pwm(fan, target, "max", remember=False)
                     self.fan_applied[fan] = target
+                if want_floor and self.fan_floor.get(fan) != target:
+                    self.fans.set_pwm(fan, target, "min", remember=False)
+                    self.fan_floor[fan] = target
+                    self._save_floors()
+                elif not want_floor and fan in self.fan_floor:
+                    getattr(self.fans, "clear_floor", lambda f: None)(fan)
+                    self.fan_floor.pop(fan, None)
+                    self._save_floors()
             self.applied[pid] = target
             if prev is None or target != prev:
                 self.temps_seen[pid] = temp
             live[pid] = {"name": prof["name"], "sensor": name, "temp": round(temp, 1),
                          "applied": target, "fans": sorted(fan_list),
                          "mode": prof.get("mode", "curve"),
-                         "goal": round(goal, 1) if goal is not None else None}
+                         "goal": round(goal, 1) if goal is not None else None,
+                         "model": obs,
+                         "predicted_need": (round(min(100.0, f_pred), 1) if f_pred is not None else None),
+                         "hot_room": hot_room}
             run = self.learning.get(pid)
             if run:
                 live[pid]["learning"] = {
                     "step": run["i"] + 1, "of": len(run["levels"]), "level": run["levels"][run["i"]],
-                    "left_s": int(max(0, LEARN_STEP_S - (self.clock() - run["step_started"])
-                                      + LEARN_STEP_S * (len(run["levels"]) - run["i"] - 1)))}
+                    # least it can take; each step may run up to LEARN_MAX_STEP_S
+                    "left_s": int(max(0, LEARN_STEP_S - (self.clock() - run["step_started"]))
+                                  + LEARN_STEP_S * (len(run["levels"]) - run["i"] - 1)),
+                    "max_left_s": int(max(0, LEARN_MAX_STEP_S - (self.clock() - run["step_started"]))
+                                      + LEARN_MAX_STEP_S * (len(run["levels"]) - run["i"] - 1))}
         self.profile_state = live
         self.last_error = None
 
     def _adaptive(self, pid: str, prof: Dict[str, Any], temp: float, goal: float,
-                  hyst: float, up: int) -> int:
-        """Find the lowest fan speed that holds `temp` at or under `goal`."""
+                  hyst: float, up: int, f_pred: Optional[float] = None) -> int:
+        """Find the lowest fan speed that holds `temp` at or under `goal`.
+
+        With a good learned model (`f_pred`: the speed it predicts is needed right
+        now, for the current load and room temperature) it heads straight there
+        instead of feeling its way - faster down when the model says there's room,
+        straight up to the prediction when over target. The temperature feedback
+        below still has the final say, so a wrong model can't overheat anything.
+        """
         now = self.clock()
+        if f_pred is not None:
+            f_pred = max(0.0, min(100.0, f_pred))
         a = self.adapt.get(pid)
         if a is None:
-            # Carry on from what it learned before a restart; otherwise start from
-            # what the curve would give, so switching modes isn't a jolt.
+            # Carry on from what it learned before a restart; otherwise start from the
+            # model's prediction or from what the curve gives, so switching isn't a jolt.
             saved = self.learned.read().get(pid)
-            start = float(saved) if isinstance(saved, (int, float)) else float(interpolate(prof["points"], temp))
+            start = (float(saved) if isinstance(saved, (int, float))
+                     else f_pred if f_pred is not None else float(interpolate(prof["points"], temp)))
             a = self.adapt[pid] = {"out": start, "hist": [], "last_up": 0.0, "last_down": now}
         a["hist"] = [(t, v) for t, v in a["hist"] if now - t <= ADAPT_TREND_S] + [(now, temp)]
         first_t, first_v = a["hist"][0]
@@ -445,6 +529,10 @@ class CurveEngine:
                 # Size the step by how far over it is and how fast it's still climbing.
                 step = err * 1.5 + max(0.0, slope) * 2.0
                 a["out"] += min(float(up), max(1.0, step))
+                if f_pred is not None and f_pred > a["out"]:
+                    # The model knows roughly how much is needed: go there in one
+                    # move (capped, in case the model is off).
+                    a["out"] = min(f_pred, a["out"] + 2 * up)
                 a["last_up"] = now
             a["last_down"] = now        # no stepping down right after being over
         elif err < -band:
@@ -452,7 +540,10 @@ class CurveEngine:
             steady_long_enough = span >= ADAPT_DOWN_EVERY_S * 0.9
             if (steady_long_enough and max(recent) < goal - band and slope <= 0.2
                     and now - a["last_down"] >= ADAPT_DOWN_EVERY_S):
-                a["out"] -= ADAPT_DOWN_STEP
+                step = ADAPT_DOWN_STEP
+                if f_pred is not None and a["out"] > f_pred + 2:
+                    step = min(3.0, a["out"] - f_pred)     # the model says there's room
+                a["out"] -= step
                 a["last_down"] = now
         floor = float(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
         a["out"] = max(floor, min(100.0, a["out"]))
@@ -463,6 +554,50 @@ class CurveEngine:
             self.learned.write(data)
             a["saved"] = result
         return result
+
+    # ------------------------------------------------------------------ #
+    # Learned models
+    # ------------------------------------------------------------------ #
+    def set_model(self, pid: str, model: Dict[str, Any]) -> None:
+        self.models[pid] = model
+        self.models_store.write(self.models)
+
+    def usable_model(self, pid: str) -> Optional[Dict[str, Any]]:
+        m = self.models.get(pid)
+        return m if m and not m.get("error") and "inlet" in self.live else None
+
+    def _observe(self, pid: str, prof: Dict[str, Any], temp: float, fans: List[int]) -> Optional[Dict[str, Any]]:
+        """Compare reality with the model: keep its live bias up to date, and flag a
+        part that runs much hotter than it should for this load and airflow."""
+        m = self.usable_model(pid)
+        real = [self.fan_actual[f] for f in fans if isinstance(self.fan_actual.get(f), (int, float))]
+        if not m or not real:
+            return None
+        from .tuner import predict_temp
+        now = self.clock()
+        expect = predict_temp(m, self.live.get("power", 0.0), self.live["inlet"], sum(real) / len(real))
+        miss = temp - expect
+        hist = [x for x in self.track.get(pid, []) if now - x[0] <= 600] + [(now, temp, miss)]
+        self.track[pid] = hist
+        steady = len(hist) >= 3 and max(h[1] for h in hist[-6:]) - min(h[1] for h in hist[-6:]) <= 1.0
+        if steady:
+            # Slow, bounded correction: the model is a week's average, today may differ a bit.
+            b = self.bias.get(pid, 0.0)
+            self.bias[pid] = max(-3.0, min(3.0, b + 0.02 * (miss - b)))
+        span = now - hist[0][0]
+        avg_miss = sum(h[2] for h in hist) / len(hist)
+        limit = max(4.0, 3 * m.get("tested_c", 1.0))
+        if span >= 540 and steady and avg_miss > limit and now - self.anomaly_at.get(pid, 0) > 6 * 3600:
+            self.anomaly_at[pid] = now
+            self.log("anomaly", f"{prof['name']}: running {avg_miss:.1f}°C hotter than expected for this load, "
+                                f"room temperature and fan speed (expected ~{expect:.0f}°C, seeing {temp:g}°C). "
+                                f"Worth checking for dust, a weak fan or blocked airflow.")
+        return {"expect": round(expect, 1), "bias": round(self.bias.get(pid, 0.0), 2)}
+
+    def _save_floors(self) -> None:
+        data = self.learned.read()
+        data["_floors"] = {str(k): v for k, v in self.fan_floor.items()}
+        self.learned.write(data)
 
     def _forget_learned(self, pid: str) -> None:
         if pid in self.adapt:
@@ -480,4 +615,5 @@ class CurveEngine:
             "last_error": self.last_error,
             "tripped_at": self.tripped_at,
             "trip_reason": self.trip_reason,
+            "models": self.models,
         }

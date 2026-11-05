@@ -128,6 +128,32 @@ class ServerWorker(threading.Thread):
         finally:
             self._build_snapshot()
 
+    def profile_inputs(self, pid: str) -> Optional[Dict[str, Any]]:
+        """What the model for one curve learns from: its sensors, its fans, its limit."""
+        from .curve import hot_sensor, sensor_limit
+        cfg = self.curve.config(self._fan_count)
+        prof = next((p for p in cfg["profiles"] if p["id"] == pid), None)
+        if not prof:
+            return None
+        known = history_db.names(self.sid).get("temp", [])
+        sel = prof["sensor"]
+        if sel == "__cpu__":
+            sensors = [n for n in known if "cpu" in n.lower() or "proc" in n.lower()]
+        elif sel == "__hottest__":
+            sensors = known
+        else:
+            sensors = [n for n in known if n.lower() == sel.lower()] or \
+                      [n for n in known if sel.lower() in n.lower()]
+        fans_live = (self.thermal or {}).get("fans", [])
+        temps = (self.thermal or {}).get("temperatures", [])
+        name, _ = hot_sensor(temps, sel)
+        return {"prof": prof, "sensors": sensors,
+                "fans": [fans_live[int(i)]["name"] for i, p in cfg["assign"].items()
+                         if p == pid and int(i) < len(fans_live)],
+                "limit": sensor_limit(temps, name),
+                "margin": float(self.cfg.get("watchdog_margin_c", 5)),
+                "floor": int(self.cfg.get("min_pwm_percent", 0))}
+
     def update_settings(self, cfg: Dict[str, Any]) -> None:
         """Take new limits (minimum speed, poll interval, watchdog…) without a restart."""
         self.cfg.update(cfg)
@@ -196,6 +222,17 @@ class ServerWorker(threading.Thread):
         fans_live = self.thermal["fans"]
         if fans_live:
             self._fan_count = len(fans_live)
+        self.curve.fan_actual = {f["index"]: f["reading"] for f in fans_live
+                                 if isinstance(f.get("reading"), (int, float))}
+        live: Dict[str, float] = {}
+        from .tuner import pick_inlet
+        inlet_name = pick_inlet([t["name"] for t in self.thermal["temperatures"]])
+        inlet = next((t["reading"] for t in self.thermal["temperatures"] if t["name"] == inlet_name), None)
+        if isinstance(inlet, (int, float)):
+            live["inlet"] = float(inlet)
+        if isinstance((self.power or {}).get("consumed_watts"), (int, float)):
+            live["power"] = float(self.power["consumed_watts"])
+        self.curve.live = live
         temps = self.thermal["temperatures"]
 
         self._watch_power_state(now)

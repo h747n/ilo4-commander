@@ -5,7 +5,7 @@
   const RANGES = { "1h":3600, "6h":21600, "24h":86400, "7d":604800, "30d":2592000, "90d":7776000 };
   const UNIT = { temp:"°C", fan:"%", power:"W", target:"%" };
   const PALETTE = ["#4C8DFF","#F2A93B","#A78BFA","#22D3EE","#F472B6","#34D399","#FB923C","#94A3B8","#E879F9","#FACC15"];
-  const EVENT_COLOR = { power:"#4C8DFF", reassert:"#2FC08B", watchdog:"#F2A93B", handback:"#F2A93B", link:"#F0555A", tune:"#4C8DFF", info:"#98A2B2" };
+  const EVENT_COLOR = { power:"#4C8DFF", reassert:"#2FC08B", watchdog:"#F2A93B", handback:"#F2A93B", link:"#F0555A", tune:"#4C8DFF", anomaly:"#F0555A", info:"#98A2B2" };
   const H = {
     kind:"temp", range: store.get("ilo.hrange", "24h"), end:null,
     sel:{ temp:null, fan:null, power:null, target:null }, colors:new Map(),

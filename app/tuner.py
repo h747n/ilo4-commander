@@ -1,27 +1,29 @@
-"""Design a fan curve from how this server actually behaves.
+"""Learn how each curve's part heats up, and design curves from it.
 
-The first version turned "temperature → speed adaptive mode settled on"
-pairs straight into a curve. That can't work: in adaptive mode the
-temperature sits near the target and only the speed moves with the load, so
-the pairs form a vertical column, and one odd moment (a jump to 100%) was
-enough to flatten the whole curve at 88%.
-
-This version learns a model instead, from every steady five-minute period
-in the history - fixed-curve periods as well as adaptive ones:
+The model, per curve, from every steady five-minute period in the history
+(fixed-curve, adaptive and Learn periods alike):
 
     temperature - inlet temperature = (a + b * power) / (fan% + c)
 
-i.e. heat in (a fixed part plus a part that grows with the server's power
-draw) over airflow (fan speed, plus c for the airflow the chassis gets
-anyway). Fitted per curve by least squares; it reports its own error.
+heat in (a fixed part plus a part that grows with the server's power draw)
+over airflow (fan speed, plus c for the airflow the chassis gets anyway).
 
-With that model it *designs* the curve rather than copying data: from the
-mildest conditions seen (low load, cool room) to the harshest (peak load
-plus 10%, warmest inlet plus 1°C) it picks equilibrium points so the fans
-sit at the minimum when it's easy and reach exactly what's needed to hold
-the target in the worst case. Above the target it climbs to 100% before the
-watchdog's trip point. It also predicts where the new curve will settle at
-typical and peak load, so you can judge it before applying it.
+Only the fans that actually follow the curve count, every 5% band of fan
+speed is weighted equally (so a 30-minute Learn run isn't drowned by weeks at
+one speed), and the accuracy is checked honestly: every fifth hour is held
+back and the model is graded on it. It is refitted in the
+background every 20 minutes from up to 30 days of history (learner.py), and
+adaptive mode uses it to go straight to the speed it predicts it needs.
+
+From the model a curve is *designed*: minimum speed when conditions are
+easy, just enough to hold the target at the harshest load and room
+temperature seen (+10% / +1°C), then a climb to 100% before the watchdog
+trip point - with predictions of where it will settle.
+
+The first version copied "temperature -> speed adaptive mode settled on"
+pairs into a curve; in adaptive mode the temperature sits near the target
+and only the speed moves, so that produced a column, and one odd moment
+flattened a whole suggestion at 88%. Hence all of the above.
 """
 from __future__ import annotations
 
@@ -33,10 +35,19 @@ from .history_db import history_db
 STEADY_TEMP_C = 1.5         # max swing of the temperature within a bucket
 STEADY_FAN = 3.0            # ... and of the fan speed
 MIN_ROWS = 24               # steady 5-minute periods needed (~2 hours)
-MIN_FAN_SPREAD = 4.0        # p10..p90 of fan speed: below this airflow can't be learned
-MAX_MAE_C = 2.0             # model must predict within this on average
+MIN_FAN_SPREAD = 4.0        # fan speeds seen (each held >= 10 min) must span this much
+FAN_BIN = 5.0               # rows are weighted so every 5% band of fan speed counts equally
+MOVING_FAN = 3.0            # a fan whose speed never moves more than this isn't one we drive
+GOOD_C = 1.5                # tested error for a model adaptive mode may lean on
+MAX_ERR_C = 2.5             # beyond this it isn't used at all
 STUCK_SHARE = 0.6           # sensor at one value this often = it's floored
 DESIGN_STEPS = 5
+
+
+def pick_inlet(names: List[str]) -> Optional[str]:
+    """The chassis air-intake sensor: "Inlet Ambient", not a power supply's inlet."""
+    inl = [n for n in names if "inlet" in n.lower()]
+    return next((n for n in inl if "ambient" in n.lower()), inl[0] if inl else None)
 
 
 def _pct(vals: Sequence[float], q: float) -> float:
@@ -61,16 +72,114 @@ def _buckets(server: str, kind: str, names: List[str], since: int, until: int, p
     return res
 
 
-def fit(rows: List[Tuple[float, float, float]]) -> Optional[Dict[str, float]]:
-    """rows: (temp rise over inlet, fan %, power W). Returns a, b, c and the error."""
-    best = None
-    for c10 in range(5, 801, 5):                       # c from 0.5 to 80 % in 0.5 steps
-        c = c10 / 10
+def _driven_fans(server: str, fan_names: List[str], since: int, until: int,
+                 points: int) -> Dict[int, Tuple[float, float, float]]:
+    """The curve's real fan speed, bucket by bucket: (value, lo, hi).
+
+    Only fans that actually follow the curve count. Some fans in a group sit
+    at a floor set elsewhere (on a DL380p "Fan 5" stays at 5% while "Fan 6"
+    follows the HD controller curve): averaging them in blurs the speed, and
+    the gap between them made every bucket look unsteady. lo/hi is each fan's
+    own swing within the bucket, not the gap between fans.
+    """
+    series: Dict[str, Dict[int, Tuple[float, float, float]]] = {}
+    for n in fan_names:
+        got = history_db.query(server, "fan", n, since, until, points)
+        if got:
+            series[n] = {p["ts"]: (p["avg"], p["min"], p["max"]) for p in got}
+    if not series:
+        return {}
+
+    def spread(s: Dict[int, Tuple[float, float, float]]) -> float:
+        v = [x[0] for x in s.values()]
+        return _pct(v, .98) - _pct(v, .02)
+
+    keep = [n for n, s in series.items() if spread(s) >= MOVING_FAN] or list(series)
+    out: Dict[int, Tuple[float, float, float]] = {}
+    for ts in set().union(*(series[n].keys() for n in keep)):
+        vals = [series[n][ts] for n in keep if ts in series[n]]
+        avg = sum(v[0] for v in vals) / len(vals)
+        swing = max(v[2] - v[1] for v in vals)
+        out[ts] = (avg, avg - swing / 2, avg + swing / 2)
+    return out
+
+
+def _weights(fans: List[float]) -> List[float]:
+    """Every 5% band of fan speed counts about equally (a band needs 3 rows to count fully)."""
+    count: Dict[int, int] = {}
+    for f in fans:
+        count[int(f // FAN_BIN)] = count.get(int(f // FAN_BIN), 0) + 1
+    return [1.0 / max(3, count[int(f // FAN_BIN)]) for f in fans]
+
+
+def _fan_levels(fans: List[float]) -> List[float]:
+    """Median speed of each 5% band held for at least 10 minutes (2 rows)."""
+    bands: Dict[int, List[float]] = {}
+    for f in fans:
+        bands.setdefault(int(f // FAN_BIN), []).append(f)
+    return sorted(_pct(v, .5) for v in bands.values() if len(v) >= 2)
+
+
+# ---------------------------------------------------------------------- #
+# Data
+# ---------------------------------------------------------------------- #
+def collect(server: str, sensors: List[str], fan_names: List[str], profile_name: str,
+            days: int = 30) -> Dict[str, Any]:
+    """Steady periods as rows: ts, temp, rise over inlet, fan %, power, inlet."""
+    now = int(time.time())
+    # A few minutes inside the window, so it never lands right on the raw-retention
+    # edge and flips between storage tiers from one second to the next.
+    since = now - max(1, min(30, days)) * 86400 + 300
+    pts = max(60, (now - since) // 300)                  # ~5-minute buckets
+    temp = _buckets(server, "temp", sensors, since, now, pts)
+    inlet_name = pick_inlet(history_db.names(server).get("temp", []))
+    inlet = _buckets(server, "temp", [inlet_name] if inlet_name else [], since, now, pts)
+    power = _buckets(server, "power", ["system"], since, now, pts)
+    actual = _driven_fans(server, fan_names, since, now, pts)
+    ceiling = _buckets(server, "target", [profile_name], since, now, pts)
+
+    rows, values = [], []
+    for ts in sorted(temp):
+        t, tmin, tmax = temp[ts]
+        fan = actual.get(ts) or ceiling.get(ts)          # the real speed when we have it
+        if not fan or ts not in inlet:
+            continue
+        values.append(round(t))
+        if tmax - tmin > STEADY_TEMP_C or fan[2] - fan[1] > STEADY_FAN:
+            continue                                     # not at equilibrium
+        rise = t - inlet[ts][0]
+        if rise <= 0.5:
+            continue
+        rows.append({"ts": ts, "t": t, "rise": rise, "fan": fan[0],
+                     "p": power.get(ts, (0.0, 0, 0))[0], "tin": inlet[ts][0]})
+    stuck = None
+    if values:
+        top = max(set(values), key=values.count)
+        if values.count(top) / len(values) >= STUCK_SHARE and _pct(values, .9) - _pct(values, .1) <= 2:
+            stuck = top
+    return {"rows": rows, "stuck": stuck, "bucket_s": (now - since) / pts}
+
+
+# ---------------------------------------------------------------------- #
+# Model
+# ---------------------------------------------------------------------- #
+def fit(rows: List[Tuple[float, float, float]],
+        weights: Optional[List[float]] = None) -> Optional[Dict[str, float]]:
+    """rows: (temp rise over inlet, fan %, power W). Returns a, b, c and the error.
+
+    weights make rare fan speeds (a Learn run) count as much as the weeks
+    spent at one speed; the error returned is weighted the same way."""
+    w = weights or [1.0] * len(rows)
+    scale = len(rows) / sum(w)                         # keep sums at their usual size
+    w = [k * scale for k in w]
+    y = [dt for dt, _, _ in rows]
+
+    def at(c: float) -> Optional[Dict[str, float]]:
         u = [1 / (f + c) for _, f, _ in rows]
         v = [p / (f + c) for _, f, p in rows]
-        y = [dt for dt, _, _ in rows]
-        suu = sum(x * x for x in u); svv = sum(x * x for x in v); suv = sum(a * b for a, b in zip(u, v))
-        suy = sum(a * b for a, b in zip(u, y)); svy = sum(a * b for a, b in zip(v, y))
+        suu = sum(k * x * x for k, x in zip(w, u)); svv = sum(k * x * x for k, x in zip(w, v))
+        suv = sum(k * a * b for k, a, b in zip(w, u, v))
+        suy = sum(k * a * b for k, a, b in zip(w, u, y)); svy = sum(k * a * b for k, a, b in zip(w, v, y))
         det = suu * svv - suv * suv
         a = b = None
         if det > 1e-12:
@@ -79,14 +188,95 @@ def fit(rows: List[Tuple[float, float, float]]) -> Optional[Dict[str, float]]:
         if a is None or b < 0 or a < 0:                # heat can't go down with power
             a, b = suy / suu, 0.0
         if a <= 0:
-            continue
-        err = [abs(yi - (a + b * p) / (f + c)) for yi, (_, f, p) in zip(y, rows)]
-        mae = sum(err) / len(err)
-        if best is None or mae < best["mae"]:
-            best = {"a": a, "b": b, "c": c, "mae": mae}
+            return None
+        mae = sum(k * abs(yi - (a + b * p) / (f + c)) for k, yi, (_, f, p) in zip(w, y, rows)) / len(rows)
+        return {"a": a, "b": b, "c": c, "mae": mae}
+
+    def better(x, y_):
+        return y_ if (x is None or (y_ is not None and y_["mae"] < x["mae"])) else x
+
+    # c (the airflow the chassis gets with the fan at 0%) from 0.5 to 200: coarse, then fine.
+    best = None
+    for c2 in range(1, 401, 4):
+        best = better(best, at(c2 / 2))
+    if best:
+        c0 = best["c"]
+        for d4 in range(-8, 9):
+            c = c0 + d4 / 4
+            if c >= 0.5:
+                best = better(best, at(c))
     return best
 
 
+def _rise(m: Dict[str, float], power: float, fan: float) -> float:
+    return (m["a"] + m["b"] * power) / (fan + m["c"])
+
+
+def predict_temp(m: Dict[str, float], power: float, inlet: float, fan: float, bias: float = 0.0) -> float:
+    return inlet + _rise(m, power, fan) + bias
+
+
+def needed_fan(m: Dict[str, float], power: float, inlet: float, temp: float, bias: float = 0.0) -> float:
+    """Fan % the model says holds `temp` (999 when it can't be done)."""
+    room = temp - inlet - bias
+    return (m["a"] + m["b"] * power) / room - m["c"] if room > 0.5 else 999.0
+
+
+def learn(data: Dict[str, Any]) -> Dict[str, Any]:
+    """A model, or {"error": why not} - in plain words."""
+    rows = data["rows"]
+    if data.get("stuck") is not None:
+        top = data["stuck"]
+        return {"error": f"This sensor sits at {top}°C almost all the time - iLO 4 reports CPUs as {top}° "
+                         f"whenever they're cooler than that - so there's nothing to learn from yet. It "
+                         f"will learn by itself once the server sees real load.", "kind": "stuck"}
+    if len(rows) < MIN_ROWS:
+        return {"error": f"Not enough steady data yet ({len(rows)} of {MIN_ROWS} five-minute periods where "
+                         f"temperature and fan speed both held still).", "kind": "short"}
+    fans = [r["fan"] for r in rows]
+    levels = _fan_levels(fans)
+    if not levels or levels[-1] - levels[0] < MIN_FAN_SPREAD:
+        lo, hi = (levels[0], levels[-1]) if levels else (min(fans), max(fans))
+        return {"error": f"The fan speed has hardly changed ({lo:.0f}–{hi:.0f}%), so "
+                         f"there's no way to tell how much difference airflow makes. Press Learn on this curve "
+                         f"(about 30 minutes) - or let adaptive mode move the fans for a while.", "kind": "flat"}
+    as_fit = lambda rs: [(r["rise"], r["fan"], r["p"]) for r in rs]
+    wts = _weights(fans)
+    m = fit(as_fit(rows), wts)
+    if not m:
+        return {"error": "Couldn't fit a model to this data.", "kind": "bad"}
+    # Honest grade on data it hasn't seen: every fifth hour is held back, so the
+    # test covers old and new data and every fan speed (a Learn run is recent and
+    # short - "the newest 20%" would have been nothing but Learn, never trained on).
+    tested = m["mae"]
+    if len(rows) >= 40:
+        hold = [(r["ts"] // 3600) % 5 == 0 for r in rows]
+        tr = [i for i, h in enumerate(hold) if not h]
+        te = [i for i, h in enumerate(hold) if h]
+        if len(te) >= 5 and len(tr) >= MIN_ROWS:
+            train = fit(as_fit([rows[i] for i in tr]), _weights([fans[i] for i in tr]))
+            if train:
+                tw = _weights([fans[i] for i in te])
+                tested = sum(k * abs(rows[i]["rise"] - _rise(train, rows[i]["p"], rows[i]["fan"]))
+                             for k, i in zip(tw, te)) / sum(tw)
+    if tested > MAX_ERR_C:
+        return {"error": f"The temperature doesn't follow fan speed and load closely enough to predict "
+                         f"(it missed recent data by {tested:.1f}°C on average).", "kind": "bad"}
+    P = [r["p"] for r in rows]; TIN = [r["tin"] for r in rows]
+    return {"a": round(m["a"], 3), "b": round(m["b"], 5), "c": round(m["c"], 2),
+            "error_c": round(m["mae"], 2), "tested_c": round(tested, 2),
+            "quality": "good" if tested <= GOOD_C else "rough",
+            "n": len(rows), "hours": round(len(rows) * data["bucket_s"] / 3600, 1),
+            "fan_seen": [round(levels[0]), round(levels[-1])],
+            "power": [round(_pct(P, .05)), round(_pct(P, .5)), round(max(P))],
+            "inlet": [round(_pct(TIN, .05), 1), round(_pct(TIN, .5), 1), round(max(TIN), 1)],
+            "temp_seen": [round(min(r["t"] for r in rows)), round(max(r["t"] for r in rows))],
+            "fitted_at": int(time.time())}
+
+
+# ---------------------------------------------------------------------- #
+# Design
+# ---------------------------------------------------------------------- #
 def _equilibrium(points: List[List[float]], d: float, tin: float, c: float) -> Tuple[float, float]:
     """Where a curve settles: the temperature T with T = tin + d / (curve(T) + c)."""
     from .curve import interpolate
@@ -101,86 +291,29 @@ def _equilibrium(points: List[List[float]], d: float, tin: float, c: float) -> T
     return round(t, 1), round(interpolate(points, t), 1)
 
 
-def suggest(server: str, sensors: List[str], fan_names: List[str], profile_name: str,
-            target: Optional[float], limit: Optional[float], margin: float,
-            min_floor: int = 0, days: int = 7) -> Dict[str, Any]:
-    now = int(time.time())
-    # A few minutes inside the window, so "2 days" never lands right on the 48-hour
-    # raw-retention edge and flips between storage tiers from one second to the next.
-    since = now - max(1, min(30, days)) * 86400 + 300
-    pts = max(60, (now - since) // 300)                  # ~5-minute buckets
-    temp = _buckets(server, "temp", sensors, since, now, pts)
-    inlet_names = [n for n in history_db.names(server).get("temp", []) if "inlet" in n.lower()]
-    inlet = _buckets(server, "temp", inlet_names[:1], since, now, pts)
-    power = _buckets(server, "power", ["system"], since, now, pts)
-    actual = _buckets(server, "fan", fan_names, since, now, pts, combine=None)
-    ceiling = _buckets(server, "target", [profile_name], since, now, pts)
+def settle(m: Dict[str, Any], points: List[List[float]], power: float, inlet: float) -> Tuple[float, float]:
+    """Where `points` would settle at this load and room temperature, per the model."""
+    return _equilibrium(points, m["a"] + m["b"] * power, inlet, m["c"])
 
-    rows, samples, stuck_vals = [], [], []
-    for ts, (t, tmin, tmax) in temp.items():
-        fan = actual.get(ts) or ceiling.get(ts)          # real speed when we have it
-        if not fan or ts not in inlet:
-            continue
-        stuck_vals.append(round(t))
-        if tmax - tmin > STEADY_TEMP_C or fan[2] - fan[1] > STEADY_FAN:
-            continue                                     # not at equilibrium
-        p = power.get(ts, (0.0, 0, 0))[0]
-        rise = t - inlet[ts][0]
-        if rise <= 0.5:
-            continue
-        rows.append((rise, fan[0], p, inlet[ts][0], t))
-        samples.append({"t": round(t, 1), "p": round(fan[0], 1)})
 
-    hours = round(len(rows) * (now - since) / pts / 3600, 1)
-    out: Dict[str, Any] = {"pairs": len(rows), "hours": hours,
-                           "samples": samples[:: max(1, len(samples) // 400)], "notes": []}
-    if stuck_vals:
-        top = max(set(stuck_vals), key=stuck_vals.count)
-        if stuck_vals.count(top) / len(stuck_vals) >= STUCK_SHARE and \
-                _pct(stuck_vals, .9) - _pct(stuck_vals, .1) <= 2:
-            out["error"] = (f"This sensor sits at {top}°C almost all the time - iLO 4 reports CPUs as "
-                            f"{top}° whenever they're cooler than that - so there's nothing to learn "
-                            f"from. Keep your current curve; it only matters under real load.")
-            return out
-    if len(rows) < MIN_ROWS:
-        out["error"] = (f"Not enough steady data yet ({len(rows)} of {MIN_ROWS} five-minute periods "
-                        f"where temperature and fan speed both held still).")
-        return out
-    fans = [r[1] for r in rows]
-    if _pct(fans, .9) - _pct(fans, .1) < MIN_FAN_SPREAD:
-        out["error"] = (f"The fan speed has hardly changed ({_pct(fans, .1):.0f}–{_pct(fans, .9):.0f}%), "
-                        f"so there's no way to tell how much difference airflow makes. Press Learn "
-                        f"on this curve (about 30 minutes), then try again.")
-        return out
-
-    m = fit([(r[0], r[1], r[2]) for r in rows])
-    if not m or m["mae"] > MAX_MAE_C:
-        out["error"] = (f"The temperature doesn't follow fan speed and load closely enough to predict "
-                        f"(error {m['mae']:.1f}°C)." if m else "Couldn't fit a model to this data.")
-        return out
+def design(m: Dict[str, Any], target: Optional[float], limit: Optional[float], margin: float,
+           floor_pct: int) -> Dict[str, Any]:
     a, b, c = m["a"], m["b"], m["c"]
-    out["model"] = {"a": round(a, 1), "b": round(b, 3), "c": round(c, 1), "error_c": round(m["mae"], 2)}
-
     trip = (limit - margin) if limit else None
     if target is None:
-        target = (trip - 5) if trip else _pct([r[4] for r in rows], .95) + 2
+        target = (trip - 5) if trip else m["temp_seen"][1] + 2
     if trip is not None:
         target = min(target, trip - 3)
     target = float(target)
-
-    P = [r[2] for r in rows]; TIN = [r[3] for r in rows]
-    mild = (a + b * _pct(P, .05), _pct(TIN, .05))
-    harsh = ((a + b * max(P)) * 1.10, max(TIN) + 1.0)
-    floor = float(max(min_floor, 1))
-    fan_needed = harsh[0] / (target - harsh[1]) - c if target > harsh[1] else 999
-    if fan_needed > 100:
-        out["error"] = (f"Even 100% can't hold {target:.0f}°C at peak load in a warm room "
-                        f"(the model says it needs ~{fan_needed:.0f}%). Pick a higher target.")
-        return out
-
-    t_mild = mild[1] + mild[0] / (floor + c)             # minimum speed, easy conditions
-    if t_mild > target - 4:
-        t_mild = target - 4
+    p_lo, p_mid, p_hi = m["power"]; t_lo, t_mid, t_hi = m["inlet"]
+    mild = (a + b * p_lo, t_lo)
+    harsh = ((a + b * p_hi) * 1.10, t_hi + 1.0)
+    floor = float(max(floor_pct, 1))
+    need = harsh[0] / (target - harsh[1]) - c if target > harsh[1] else 999
+    if need > 100:
+        return {"error": f"Even 100% can't hold {target:.0f}°C at peak load in a warm room (the model says it "
+                         f"needs ~{need:.0f}%). Pick a higher target.", "target": round(target, 1)}
+    t_mild = min(mild[1] + mild[0] / (floor + c), target - 4)   # minimum speed, easy conditions
     curve: List[List[int]] = []
     for i in range(DESIGN_STEPS + 1):
         s = i / DESIGN_STEPS
@@ -194,7 +327,6 @@ def suggest(server: str, sensors: List[str], fan_names: List[str], profile_name:
     last_f = curve[-1][1]
     curve.append([int(round((target + top_t) / 2)), int(round(last_f + (100 - last_f) * 0.45))])
     curve.append([int(round(top_t)), 100])
-
     clean: List[List[int]] = []
     for t, f in curve:                                   # strictly rising temps, never-falling speed
         t = max(0, min(120, t)); f = max(int(floor), min(100, f))
@@ -204,15 +336,57 @@ def suggest(server: str, sensors: List[str], fan_names: List[str], profile_name:
                 clean[-1][1] = max(clean[-1][1], f)
                 continue
         clean.append([t, f])
-
-    typ = (a + b * _pct(P, .5), _pct(TIN, .5))
-    peak = (a + b * max(P), max(TIN))
-    ty_t, ty_f = _equilibrium(clean, typ[0], typ[1], c)
-    pk_t, pk_f = _equilibrium(clean, peak[0], peak[1], c)
-    out.update(points=clean, target=round(target, 1), trip=round(trip, 1) if trip else None,
-               observed=[round(min(r[4] for r in rows)), round(max(r[4] for r in rows))],
-               predict={"typical": {"power": round(_pct(P, .5)), "inlet": round(typ[1], 1), "temp": ty_t, "fan": ty_f},
-                        "peak": {"power": round(max(P)), "inlet": round(peak[1], 1), "temp": pk_t, "fan": pk_f}})
+    ty_t, ty_f = settle(m, clean, p_mid, t_mid)
+    pk_t, pk_f = settle(m, clean, p_hi, t_hi)
+    hot_in = t_hi + 5                                     # a room warmer than ever seen
+    hr_t, hr_f = settle(m, clean, p_mid, hot_in)
+    out = {"points": clean, "target": round(target, 1), "trip": round(trip, 1) if trip else None, "notes": [],
+           "predict": {"typical": {"power": p_mid, "inlet": t_mid, "temp": ty_t, "fan": ty_f},
+                       "peak": {"power": p_hi, "inlet": t_hi, "temp": pk_t, "fan": pk_f},
+                       "hot_room": {"power": p_mid, "inlet": hot_in, "temp": hr_t, "fan": hr_f}}}
+    # Adaptive mode in the same conditions: it runs whatever each moment needs to
+    # hold just under the target, instead of a curve that must already cover a hot day.
+    goal = target - 1.0
+    def held(p: float, tin: float) -> Dict[str, Any]:
+        f = max(floor, min(100.0, needed_fan(m, p, tin, goal)))
+        t = goal if floor < f < 100 else predict_temp(m, p, tin, f)   # at a limit: wherever that leaves it
+        return {"temp": round(t, 1), "fan": round(f, 1)}
+    out["adaptive"] = {"typical": held(p_mid, t_mid), "peak": held(p_hi, t_hi), "hot_room": held(p_mid, hot_in)}
+    ad_f = out["adaptive"]["typical"]["fan"]
+    if ad_f < ty_f - 3:
+        out["prefer"] = "adaptive"
+        per10 = predict_temp(m, p_mid, t_mid, ty_f) - predict_temp(m, p_mid, t_mid, min(100.0, ty_f + 10))
+        weak = per10 < 3
+        out["notes"].append(
+            (f"This part responds weakly to its fans (+10% cools it only ~{per10:.1f}°C), so any fixed curve "
+             f"that is safe on a hot day is loud on a normal one. " if weak else "") +
+            f"Adaptive mode with a {target:.0f}° maximum would be quieter: about {ad_f:.0f}% at typical load "
+            f"instead of {ty_f:.0f}%, speeding up only when conditions really call for it.")
     if pk_t > target + 0.5:
         out["notes"].append(f"At peak load it would settle at {pk_t}°C, a little over the target.")
+    if hr_t > target + 0.5:
+        out["notes"].append(f"If the room reached {hot_in:g}°C it would settle at {hr_t}°C; the watchdog and "
+                            f"the climb to 100% cover that, but adaptive mode handles it more quietly.")
+    return out
+
+
+def suggest(server: str, sensors: List[str], fan_names: List[str], profile_name: str,
+            target: Optional[float], limit: Optional[float], margin: float,
+            min_floor: int = 0, days: int = 30, current: Optional[List[List[float]]] = None) -> Dict[str, Any]:
+    data = collect(server, sensors, fan_names, profile_name, days)
+    rows = data["rows"]
+    out: Dict[str, Any] = {"pairs": len(rows), "hours": round(len(rows) * data["bucket_s"] / 3600, 1),
+                           "samples": [{"t": round(r["t"], 1), "p": round(r["fan"], 1)}
+                                       for r in rows[:: max(1, len(rows) // 400)]], "notes": []}
+    m = learn(data)
+    if m.get("error"):
+        out["error"] = m["error"]
+        return out
+    out["model"] = m
+    out["observed"] = m["temp_seen"]
+    d = design(m, target, limit, margin, min_floor)
+    out.update(d)
+    if current and d.get("points"):
+        now_t, now_f = settle(m, current, m["power"][1], m["inlet"][1])
+        out["current"] = {"temp": now_t, "fan": now_f}
     return out

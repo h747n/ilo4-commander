@@ -75,6 +75,10 @@ class FanControl:
         data["mode"] = mode
         self.state.write(data)
 
+    def clear_floor(self, fan: int) -> None:
+        """Drop a floor set by a Learn run (min 0 isn't reachable through set_pwm's clamp)."""
+        self.shell.run(f"fan p {int(fan)} min 0")
+
     def unlock(self, fan: Union[int, str] = "all") -> Dict[str, Any]:
         targets = self._targets(fan)
         res = []

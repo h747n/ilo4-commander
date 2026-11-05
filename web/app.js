@@ -925,7 +925,7 @@ function showCurveLive() {
   else if (st?.learning)
     box.innerHTML = `<span class="live-dot" style="background:var(--uid);box-shadow:0 0 8px var(--uid)"></span>
       Learning, step <b>${st.learning.step}</b> of ${st.learning.of}: ${fanWord} held at <b>${st.applied}%</b> —
-      ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b>, about ${Math.ceil(st.learning.left_s / 60)} min left`;
+      ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b>, ${learnLeft(st.learning)} left`;
   else if (c.config?.enabled && st && st.mode === "target")
     box.innerHTML = `<span class="live-dot" style="background:var(--ok);box-shadow:0 0 8px var(--ok)"></span>
       Adaptive: ${esc(st.sensor || "sensor")} <b>${Math.round(st.temp)}°</b> (target <b>${Math.round(st.goal)}°</b>)
@@ -940,7 +940,42 @@ function showCurveLive() {
     box.innerHTML = `<span class="live-dot idle"></span>${esc(live.name)} is at <b>${live.reading}°</b> — this curve would give <b>${Math.round(effective(prof.points, live.reading))}%</b> to ${fanWord}`;
   else box.textContent = c.config?.enabled ? "Enabled — waiting for the first cycle." : `Off. Would drive ${fanWord}.`;
   if (c.last_error) box.innerHTML += ` <span class="live-err">${esc(c.last_error)}</span>`;
+  renderModelLine(prof, st);
 }
+/* The learned model for this curve: how good it is, what it expects now, and
+   whether it has designed a quieter curve. Rebuilt by the server every 20 min. */
+function renderModelLine(prof, st) {
+  const box = $("#modelLine"), m = curveStatus()?.models?.[prof.id];
+  const ago = m?.updated_at ? timeAgo(m.updated_at) : null;
+  if (!m) { box.innerHTML = `Model: not learned yet — it updates by itself every 20 minutes. <a data-relearn>Update now</a>`; return; }
+  if (m.error) {
+    box.innerHTML = `Model: <span class="warn">${esc(m.error)}</span>` + (ago ? ` <span>(checked ${ago})</span>` : "");
+    return;
+  }
+  const q = m.quality === "good" ? `<span class="ok">good</span>` : `<span class="warn">rough</span>`;
+  let html = `Model (${q}): predicts within <b>±${m.tested_c}°C</b> on recent data it hadn't seen · ` +
+    `${m.hours} h of steady data, fans ${m.fan_seen[0]}–${m.fan_seen[1]}% · updated ${ago} · <a data-relearn>update now</a>`;
+  if (st?.model) html += `<br>Right now it expects <b>${st.model.expect}°</b> (seeing ${Math.round(st.temp)}°, live correction ${st.model.bias >= 0 ? "+" : ""}${st.model.bias}°)` +
+    (st.predicted_need != null ? ` — needs about <b>${Math.round(st.predicted_need)}%</b> to hold the target` : "");
+  if (st?.hot_room) html += `<br>If the room warmed to ${st.hot_room.inlet}°, holding ${Math.round(st.goal ?? prof.target_c)}° would take ` +
+    (st.hot_room.fan > 100 ? `<span class="warn">more than 100%</span> — the watchdog would step in` : `about <b>${Math.round(Math.max(st.hot_room.fan, 0))}%</b>`);
+  const sg = m.suggestion;
+  if (sg && prof.mode !== "target" && sg.prefer === "adaptive" && sg.adaptive_typical &&
+      sg.adaptive_typical.fan < sg.current_typical.fan - 1)
+    html += `<span class="quiet">Adaptive mode at ${Math.round(sg.target)}° would be quieter: about <b>${Math.round(sg.adaptive_typical.fan)}%</b> ` +
+      `at typical load instead of <b>${Math.round(sg.current_typical.fan)}%</b> — <a data-review>review it</a></span>`;
+  else if (sg && prof.mode !== "target" && sg.typical.fan < sg.current_typical.fan - 1)
+    html += `<span class="quiet">A quieter curve is ready: about <b>${Math.round(sg.typical.fan)}%</b> at typical load instead of ` +
+      `<b>${Math.round(sg.current_typical.fan)}%</b>, holding ${Math.round(sg.typical.temp)}° — <a data-review>review it</a></span>`;
+  box.innerHTML = html;
+}
+$("#modelLine").onclick = guard(async e => {
+  if (e.target.closest("[data-review]")) return runSuggest(null);
+  if (e.target.closest("[data-relearn]")) {
+    await sapi("/curve/relearn", { method:"POST" });
+    toast("The model will be refitted within a minute", "good");
+  }
+});
 function renderProfileBar() {
   const bar = $("#profBar"); bar.innerHTML = "";
   profiles().forEach(pr => {
@@ -1061,7 +1096,10 @@ function renderModeRow() {
   const prof = curProf(); if (!prof) return;
   const adaptive = prof.mode === "target";
   $$("#profMode button").forEach(b => b.classList.toggle("on", b.dataset.pm === (prof.mode || "curve")));
-  $("#targetBox").hidden = !adaptive;
+  // One maximum per curve: adaptive mode holds it, the designer aims for the
+  // quietest curve that stays within it.
+  $("#targetLabel").textContent = adaptive ? "Keep at or below" : "Max temperature";
+  $("#targetC").title = adaptive ? "" : "Suggested curves are designed to be as quiet as possible while staying under this.";
   if (document.activeElement !== $("#targetC")) $("#targetC").value = prof.target_c ?? 65;
   $("#curveHint").textContent = adaptive
     ? "Adaptive mode: the points are only where it starts. The dashed green line is the target; the fans settle on the quietest speed that holds it."
@@ -1073,23 +1111,39 @@ function renderModeRow() {
     const m = sug.model;
     $("#suggestText").textContent = sug.error ||
       `Learned from ${sug.pairs} steady 5-minute periods (${sug.hours} h, ${sug.observed[0]}–${sug.observed[1]}°): ` +
-      `how hot this part runs for a given load, room temperature and fan speed — the model predicts it within ` +
-      `±${m.error_c}°C. The dashed green curve is designed so the fans sit as low as they can when it's easy and ` +
+      `how hot this part runs for a given load, room temperature and fan speed — tested on recent data it hadn't ` +
+      `seen, it predicts within ±${m.tested_c}°C. The dashed green curve is designed so the fans sit as low as they can when it's easy and ` +
       `reach just enough to hold ${sug.target}° at the highest load and warmest room seen (plus margin)` +
       (sug.trip ? `, then climb to 100% before the watchdog trip point (${sug.trip}°).` : ".") +
       (sug.notes?.length ? " " + sug.notes.join(" ") : "");
     const p = sug.predict;
     $("#suggestPredict").innerHTML = p ? `
       <div><span>Typical load</span><b>${p.typical.temp}° at ${p.typical.fan}%</b><small>${p.typical.power} W, room ${p.typical.inlet}°</small></div>
-      <div><span>Peak load</span><b>${p.peak.temp}° at ${p.peak.fan}%</b><small>${p.peak.power} W, room ${p.peak.inlet}°</small></div>` : "";
+      <div><span>Peak load</span><b>${p.peak.temp}° at ${p.peak.fan}%</b><small>${p.peak.power} W, room ${p.peak.inlet}°</small></div>` +
+      (p.hot_room ? `<div><span>Hot room</span><b>${p.hot_room.temp}° at ${p.hot_room.fan}%</b><small>typical load, room ${p.hot_room.inlet}°</small></div>` : "") +
+      (sug.current ? `<div><span>Your current curve</span><b>${sug.current.temp}° at ${sug.current.fan}%</b><small>typical load, for comparison</small></div>` : "") +
+      (sug.adaptive ? `<div class="${sug.prefer === "adaptive" ? "best" : ""}"><span>Adaptive at ${Math.round(sug.target)}°</span>` +
+        `<b>${sug.adaptive.typical.temp}° at ${sug.adaptive.typical.fan}%</b><small>typical load · peak ${sug.adaptive.peak.fan}% · hot room ${sug.adaptive.hot_room.fan}%</small></div>` : "") : "";
     if (document.activeElement !== $("#sugTarget") && sug.target) $("#sugTarget").value = Math.round(sug.target);
+    // When adaptive mode is the quieter way, say so and make it the main button.
+    const preferAd = sug.prefer === "adaptive" && !sug.error;
+    $("#suggestAdaptive").hidden = !preferAd;
+    $("#suggestAdaptive").disabled = adaptive && prof.target_c === Math.round(sug.target);
+    $("#suggestAdaptive").textContent = $("#suggestAdaptive").disabled ? `Already adaptive at ${Math.round(sug.target)}°`
+                                                                      : `Use adaptive at ${Math.round(sug.target)}°`;
+    $("#suggestApply").className = preferAd ? "ghost" : "primary";
+    $("#suggestApply").hidden = !!sug.error;
   }
   updateLearnButton();
+}
+function learnLeft(run) {
+  const a = Math.ceil(run.left_s / 60), b = Math.ceil((run.max_left_s ?? run.left_s) / 60);
+  return b > a ? `${a}–${b} min` : `${a} min`;
 }
 function updateLearnButton() {
   const prof = curProf(); if (!prof) return;
   const run = curveStatus()?.profile_state?.[prof.id]?.learning;
-  $("#learnBtn").textContent = run ? `Stop learning (${Math.ceil(run.left_s / 60)} min left)` : "Learn (~30 min)";
+  $("#learnBtn").textContent = run ? `Stop learning (${learnLeft(run)} left)` : "Learn (30–90 min)";
   $("#learnBtn").classList.toggle("danger", !!run);
 }
 $("#learnBtn").onclick = guard(async () => {
@@ -1098,11 +1152,11 @@ $("#learnBtn").onclick = guard(async () => {
     await sapi(`/curve/learn?profile=${encodeURIComponent(prof.id)}`, { method:"DELETE" });
     return toast("Learning stopped — normal control resumed", "good");
   }
-  if (!confirm(`Learn how "${prof.name}" responds to airflow?\n\nFor about 30 minutes its fans are held at: normal +20%, ` +
-               `then +10%, then 5% below normal — 10 minutes each. It stops at once if the temperature gets near its ` +
+  if (!confirm(`Learn how "${prof.name}" responds to airflow?\n\nIts fans are held at: normal +20%, ` +
+               `then +10%, then 5% below normal — each until the temperature settles (10–30 minutes). It stops at once if the temperature gets near its ` +
                `limit, and everything is logged. Afterwards, Suggest curve can design a curve for this server.`)) return;
   const r = await sapi("/curve/learn", { body:{ profile: prof.id } });
-  toast(`Learning started: ${r.levels.join("%, ")}% for 10 minutes each`, "good");
+  toast(`Learning started: ${r.levels.join("%, ")}% — each until the temperature settles`, "good");
 });
 async function runSuggest(target) {
   const prof = curProf(); if (!prof) return;
@@ -1114,14 +1168,19 @@ async function runSuggest(target) {
   } finally { $("#suggestBtn").disabled = false; }
   renderModeRow(); drawCurve();
 }
-$("#sugRecalc").onclick = guard(() => runSuggest(+$("#sugTarget").value || null));
+$("#sugRecalc").onclick = guard(async () => {
+  // Same setting as the curve's Max temperature: remember it there too.
+  const prof = curProf(), v = Math.max(30, Math.min(95, Math.round(+$("#sugTarget").value || 0)));
+  if (prof && v) { prof.target_c = v; prof.target_set = true; $("#targetC").value = v; await saveCurve(); }
+  return runSuggest(v || null);
+});
 $("#profMode").onclick = guard(async e => {
   const b = e.target.closest("button[data-pm]"), prof = curProf();
   if (!b || !prof || prof.mode === b.dataset.pm) return;
   prof.mode = b.dataset.pm;
-  if (prof.mode === "target") {
-    // Start just above where this sensor is now, so switching causes no jolt
-    // (an HD controller at 87° with a 65° target would go straight to 100%).
+  if (prof.mode === "target" && !prof.target_set) {
+    // No maximum chosen yet: start just above where this sensor is now, so switching
+    // causes no jolt (an HD controller at 87° with a 65° target would go straight to 100%).
     const now = selectedSensor()?.reading;
     prof.target_c = Math.max(30, Math.min(95, now != null ? Math.round(now) + 3 : (prof.target_c || 65)));
   }
@@ -1132,12 +1191,23 @@ $("#profMode").onclick = guard(async e => {
 $("#targetC").onchange = guard(async () => {
   const prof = curProf(); if (!prof) return;
   prof.target_c = Math.max(30, Math.min(95, Math.round(+$("#targetC").value || 65)));
+  prof.target_set = true;
   $("#targetC").value = prof.target_c;
   drawCurve();
-  if (await saveCurve()) toast(`Target set to ${prof.target_c}°`, "good");
+  if (await saveCurve()) toast(prof.mode === "target" ? `Holding ${prof.name} at or below ${prof.target_c}°`
+                                                      : `Max ${prof.target_c}° — suggestions will be the quietest curve under it`, "good");
 });
 $("#suggestBtn").onclick = guard(() => runSuggest(null));
 $("#suggestDiscard").onclick = () => { state.suggest = null; renderModeRow(); drawCurve(); };
+$("#suggestAdaptive").onclick = guard(async () => {
+  const prof = curProf(), sug = state.suggest;
+  if (!prof || !sug?.target || sug.pid !== prof.id) return;
+  prof.mode = "target"; prof.target_c = Math.round(sug.target); prof.target_set = true;
+  $("#targetC").value = prof.target_c;
+  state.suggest = null;
+  renderModeRow(); drawCurve();
+  if (await saveCurve()) toast(`Adaptive: keeping ${prof.name} at or below ${prof.target_c}°`, "good");
+});
 $("#suggestApply").onclick = guard(async () => {
   const prof = curProf(), sug = state.suggest;
   if (!prof || !sug?.points || sug.pid !== prof.id) return;

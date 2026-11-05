@@ -571,5 +571,12 @@ details.guide b{color:var(--ink)}
 .sug-predict b{display:block;font-family:var(--mono);font-size:15px;color:var(--ink);font-weight:500}
 .sug-predict span{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
 .sug-predict small{display:block;font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+.sug-predict>div.best{border-color:var(--ok);box-shadow:inset 0 0 0 1px var(--ok)}
 .suggest-box.bad .sug-predict,.suggest-box.bad .row{display:none}
 .act.ev-tune{border-left-color:var(--uid)}
+.model-line{font-size:12px;color:var(--dim);margin:-.1rem 0 .5rem;line-height:1.6}
+.model-line b{color:var(--ink);font-weight:500}
+.model-line .ok{color:var(--ok)} .model-line .warn{color:var(--caution)}
+.model-line a{color:var(--uid);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.model-line .quiet{display:block;margin-top:.2rem;color:var(--ok)}
+.act.ev-anomaly{border-left-color:var(--crit)}
