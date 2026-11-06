@@ -74,6 +74,12 @@ def step_reading(series: List[Tuple[float, float]], held: float) -> Tuple[Option
         return None, True
     if max(vals) - min(vals) < QUIET_C:
         return sum(vals) / len(vals), True
+    if max(vals) - min(vals) <= 1.0 and len(vals) >= 12:
+        # Whole-degree sensor flipping between two values: steady unless it trends.
+        third = len(vals) // 3
+        a, b = sum(vals[:third]) / third, sum(vals[-third:]) / third
+        if abs(b - a) < QUIET_C:
+            return sum(vals[-third:]) / third, True
     f = settle_fit(series)
     if f and f["rms"] <= 0.7 and f["tau"] < STEP_MAX_S:
         # Extrapolate only a short way: the change still to come must be small, so

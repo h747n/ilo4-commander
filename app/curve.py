@@ -516,14 +516,18 @@ class CurveEngine:
         # Done when every sensor's end value is known: either it has settled, or its
         # settling curve has been seen long enough to extrapolate (fanmap.step_reading).
         temps_now: Dict[str, float] = {}
-        known = held >= FM.STEP_FIT_MIN_S
+        # Once a sensor's end value has been worked out it stays worked out for this
+        # step (its latest estimate is used): with ~30 whole-degree sensors flipping
+        # between two values, "all known in the same poll" almost never happened.
+        seen_known = run.setdefault("known", set())
         for n in readings:
             series = [(s[0], s[1][n]) for s in run["samples"] if n in s[1]]
             val, ok = FM.step_reading(series, held)
             if val is not None:
                 temps_now[n] = val
-            if n != inlet and not ok:
-                known = False
+            if ok and held >= FM.STEP_FIT_MIN_S:
+                seen_known.add(n)
+        known = held >= FM.STEP_FIT_MIN_S and all(n in seen_known for n in readings if n != inlet)
         if not known and held >= FM.STEP_MIN_S:      # the old rule still counts
             window = [s for s in run["samples"] if now - s[0] <= FM.STEP_SETTLED_S]
             known = now - window[0][0] >= FM.STEP_SETTLED_S - 15 and all(
@@ -538,6 +542,7 @@ class CurveEngine:
             run["i"] += 1
             run["step_started"] = now
             run["samples"] = []
+            run["known"] = set()
             if run["i"] >= len(run["plan"]):
                 self._finish_mapping(FM.analyze(run["steps"], inlet))
             else:
