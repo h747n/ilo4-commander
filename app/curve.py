@@ -55,6 +55,9 @@ ADAPT_TREND_S = 120         # history used to judge whether it's rising or falli
 ADAPT_FALLING = -0.3        # °C/min: already cooling, the last increase is working
 ADAPT_PANIC_C = 8           # this far over target: 100% at once
 ADAPT_LEAD_PCT = 20         # output may run at most this far ahead of the fans' real speed
+BOOST_PCT = 15              # watchdog, first step: this much extra on every fan's real speed ...
+BOOST_HANDBACK_C = 2        # ... and only this far past the trip point hand everything to iLO
+BOOST_RELEASE_C = 3         # the extra goes once everything is this far under the trip point
 
 # "Learn": hold a curve's fans at a few known speeds so the curve designer can
 # see how much airflow matters. Up first (only ever more cooling), then one
@@ -218,7 +221,13 @@ class CurveEngine:
         # raises one fan at a time. The run in progress, and the last result.
         self.mapping: Optional[Dict[str, Any]] = None
         self.fanmap_store = JsonStore(server_dir(sid) / "fanmap.json", {})
-        self.fanmap: Optional[Dict[str, Any]] = self.fanmap_store.read() or None
+        self.fanmap: Optional[Dict[str, Any]] = {k: v for k, v in self.fanmap_store.read().items()
+                                                 if k != "_run"} or None
+        # Floors as last sent to the iLO; forgotten by reset_applied, so a reassert
+        # (e.g. after an iLO reset, which drops them) sends them again.
+        self.floor_sent: Dict[int, int] = {}
+        self.boost: Optional[Dict[str, Any]] = None       # watchdog step one: +15% pinned on every fan
+        self._resume_mapping()
 
     # ------------------------------------------------------------------ #
     def config(self, fan_count: int) -> Dict[str, Any]:
@@ -236,6 +245,7 @@ class CurveEngine:
                 self.log("tune", "Learning stopped: the curve was switched off or removed.")
         if self.mapping is not None and not clean["enabled"]:
             self.mapping = None
+            self._save_mapping()
             self._clear_floors()        # no curve step will run to clear them
             self.log("tune", "Fan map stopped: the curve was switched off.")
         return clean
@@ -245,6 +255,7 @@ class CurveEngine:
         self.applied.clear()
         self.temps_seen.clear()
         self.fan_applied.clear()
+        self.floor_sent.clear()
 
     @property
     def tripped(self) -> bool:
@@ -273,18 +284,41 @@ class CurveEngine:
         if hottest_gap is None:
             return
         if not self.tripped:
-            if hottest_gap <= 0 and managed:
+            # Two steps instead of one jump to iLO's full-speed "rocket" mode:
+            # at the trip point every fan gets +BOOST_PCT on its real speed (pinned);
+            # only BOOST_HANDBACK_C past it does iLO get everything back.
+            if managed and -BOOST_HANDBACK_C < hottest_gap <= 0:
+                if self.boost is None:
+                    self._start_boost(culprit, margin, over)
+                self._cool_ticks = 0
+                return
+            if self.boost is not None and hottest_gap > 0:
+                self._cool_ticks = self._cool_ticks + 1 if hottest_gap >= BOOST_RELEASE_C else 0
+                if self._cool_ticks >= RESUME_TICKS and time.time() - self.boost["since"] >= RESUME_MIN_S:
+                    name, val, _kind, limit = culprit
+                    mins = int((time.time() - self.boost["since"]) // 60)
+                    self.boost = None
+                    self._cool_ticks = 0
+                    self.reset_applied()
+                    self.log("watchdog", f"Cooled down after {mins} min with the extra {BOOST_PCT}% (closest now: "
+                                         f"{name} {val}°C, trip point {limit - margin:g}°C) — normal speeds back.")
+                return
+            if hottest_gap <= -BOOST_HANDBACK_C and managed:
                 name, val, kind, limit = culprit
+                boosted = self.boost is not None
+                self.boost = None
                 self.tripped_at = time.time()
                 if self.learning:
                     self.learning.clear()
                     self.log("tune", "Learning stopped: the watchdog took over.")
                 if self.mapping is not None:
                     self.mapping = None
+                    self._save_mapping()
                     self._clear_floors()
                     self.log("tune", "Fan map stopped: the watchdog took over.")
-                self.trip_reason = (f"{name} reached {val}°C — trip point {limit - margin:g}°C "
-                                    f"({kind} {limit:g}°C minus {margin:g}°C margin)")
+                self.trip_reason = (f"{name} reached {val}°C — {BOOST_HANDBACK_C:g}°C past the trip point "
+                                    f"{limit - margin:g}°C ({kind} {limit:g}°C minus {margin:g}°C margin)"
+                                    + (f", even with {BOOST_PCT}% extra on every fan" if boosted else ""))
                 others = [o for o in over if not o.startswith(f"{name} ")]
                 self._cool_ticks = 0
                 restore_err = ""
@@ -421,17 +455,19 @@ class CurveEngine:
             now = self.clock()
             self.mapping = {"plan": FM.plan(fan_count), "i": 0, "base": base, "step_started": now,
                             "samples": [], "steps": [], "started": now}
+            self._save_mapping()
             n = len(self.mapping["plan"])
             self.log("tune", f"Fan map started: every fan held where it is "
                              f"({', '.join(f'{f + 1}: {v}%' for f, v in base.items())}), then one at a time "
                              f"+{FM.BUMP_PCT}% until the temperatures settle - {n} steps, about "
-                             f"{n * FM.STEP_MIN_S // 60}-{n * FM.STEP_MAX_S // 60} min.")
+                             f"{n * FM.STEP_FIT_MIN_S // 60}-{n * FM.STEP_MAX_S // 60} min (usually 5-10 per step).")
             return self.mapping
 
     def stop_mapping(self, reason: str = "stopped by hand") -> None:
         with self._lock:
             if self.mapping is not None:
                 self.mapping = None
+                self._save_mapping()
                 self.reset_applied()
                 self.log("tune", f"Fan map {reason}. Normal control resumed.")
 
@@ -458,6 +494,7 @@ class CurveEngine:
                 guard = min(trip - 1, s0 + 2)
             if v >= guard:
                 self.mapping = None
+                self._save_mapping()
                 self.reset_applied()
                 self.log("tune", f"Fan map stopped early: {t.get('name')} reached {v:g}°C (the run's limit is "
                                  f"{guard:g}°C). Normal control resumed.")
@@ -468,46 +505,74 @@ class CurveEngine:
         if k is not None:
             levels[k] = min(100, levels[k] + FM.BUMP_PCT)
         clamp = getattr(self.fans, "_clamp", lambda p: int(p))
-        floors_changed = False
         for fan, lvl in sorted(levels.items()):
-            lvl = clamp(lvl)
-            if self.fan_applied.get(fan) != lvl:     # ceiling first, so the floor is never above it
-                self.fans.set_pwm(fan, lvl, "max", remember=False)
-                self.fan_applied[fan] = lvl
-            if self.fan_floor.get(fan) != lvl:
-                self.fans.set_pwm(fan, lvl, "min", remember=False)
-                self.fan_floor[fan] = lvl
-                floors_changed = True
-        if floors_changed:
-            self._save_floors()
+            self._drive(fan, clamp(lvl), True)
         readings = {t["name"]: float(t["reading"]) for t in temps
                     if isinstance(t.get("reading"), (int, float)) and t["reading"] > 0 and t.get("name")}
         run["samples"].append((now, readings, {str(f): float(v) for f, v in self.fan_actual.items()}))
         run["samples"] = [s for s in run["samples"] if now - s[0] <= FM.STEP_MAX_S]
         inlet = pick_inlet(list(readings))
         held = now - run["step_started"]
-        window = [s for s in run["samples"] if now - s[0] <= FM.STEP_SETTLED_S]
-        settled = held >= FM.STEP_MIN_S and now - window[0][0] >= FM.STEP_SETTLED_S - 15
-        if settled:
-            for n in readings:
-                if n == inlet:
-                    continue
-                vals = [s[1][n] for s in window if n in s[1]]
-                if vals and max(vals) - min(vals) > 1.0:
-                    settled = False
-                    break
-        if settled or held >= FM.STEP_MAX_S:
-            last = [s for s in run["samples"] if now - s[0] <= FM.MEASURE_S]
-            avg = lambda idx: {n: sum(s[idx][n] for s in last if n in s[idx]) / sum(1 for s in last if n in s[idx])
-                               for n in {n for s in last for n in s[idx]}}
-            run["steps"].append({"fan": k, "t": sum(s[0] for s in last) / len(last),
-                                 "temps": avg(1), "fans": avg(2)})
+        # Done when every sensor's end value is known: either it has settled, or its
+        # settling curve has been seen long enough to extrapolate (fanmap.step_reading).
+        temps_now: Dict[str, float] = {}
+        known = held >= FM.STEP_FIT_MIN_S
+        for n in readings:
+            series = [(s[0], s[1][n]) for s in run["samples"] if n in s[1]]
+            val, ok = FM.step_reading(series, held)
+            if val is not None:
+                temps_now[n] = val
+            if n != inlet and not ok:
+                known = False
+        if not known and held >= FM.STEP_MIN_S:      # the old rule still counts
+            window = [s for s in run["samples"] if now - s[0] <= FM.STEP_SETTLED_S]
+            known = now - window[0][0] >= FM.STEP_SETTLED_S - 15 and all(
+                max(v) - min(v) <= 1.0 for v in
+                ([s[1][n] for s in window if n in s[1]] for n in readings if n != inlet) if v)
+        if known or held >= FM.STEP_MAX_S:
+            last = [s for s in run["samples"] if now - s[0] <= min(FM.MEASURE_S, held / 2)] or run["samples"][-1:]
+            fans_avg = {n: sum(s[2][n] for s in last if n in s[2]) / sum(1 for s in last if n in s[2])
+                        for n in {n for s in last for n in s[2]}}
+            run["steps"].append({"fan": k, "t": now, "temps": temps_now, "fans": fans_avg,
+                                 "held_s": int(held)})
             run["i"] += 1
             run["step_started"] = now
             run["samples"] = []
             if run["i"] >= len(run["plan"]):
                 self._finish_mapping(FM.analyze(run["steps"], inlet))
+            else:
+                self._save_mapping()
         self.profile_state = {}
+
+    # A run survives a restart of the service (an upgrade, say): what it has
+    # measured is kept on disk and it carries on with the step it was in.
+    MAPPING_RESUME_MAX_S = 3600
+
+    def _save_mapping(self) -> None:
+        run = self.mapping
+        data = self.fanmap_store.read()
+        if run is None:
+            data.pop("_run", None)
+        else:
+            data["_run"] = {k: run[k] for k in ("plan", "i", "steps", "started")}
+            data["_run"]["base"] = {str(f): v for f, v in run["base"].items()}
+            data["_run"]["start_temps"] = run.get("start_temps") or {}
+            data["_run"]["saved_at"] = self.clock()
+        self.fanmap_store.write(data)
+
+    def _resume_mapping(self) -> None:
+        saved = (self.fanmap_store.read() or {}).get("_run")
+        if not saved:
+            return
+        if self.clock() - saved.get("saved_at", 0) > self.MAPPING_RESUME_MAX_S:
+            self._save_mapping()                       # too old to carry on: drop it
+            self.log("tune", "A fan map was interrupted too long ago to carry on; start it again if needed.")
+            return
+        now = self.clock()
+        self.mapping = {"plan": saved["plan"], "i": saved["i"], "steps": saved["steps"],
+                        "started": saved["started"], "base": {int(f): v for f, v in saved["base"].items()},
+                        "start_temps": saved.get("start_temps") or {}, "step_started": now, "samples": []}
+        self.log("tune", f"Fan map carried on after a restart, at step {saved['i'] + 1} of {len(saved['plan'])}.")
 
     def _finish_mapping(self, result: Dict[str, Any]) -> None:
         result["base_pct"] = {str(f): v for f, v in self.mapping["base"].items()}
@@ -615,17 +680,11 @@ class CurveEngine:
             want_floor = ((learn is not None and learn >= self.learning[pid]["base"])
                           or (learn is None and prof.get("mode") == "target"))
             for fan in sorted(fan_list):
-                if self.fan_applied.get(fan) != target:
-                    self.fans.set_pwm(fan, target, "max", remember=False)
-                    self.fan_applied[fan] = target
-                if want_floor and self.fan_floor.get(fan) != target:
-                    self.fans.set_pwm(fan, target, "min", remember=False)
-                    self.fan_floor[fan] = target
-                    self._save_floors()
-                elif not want_floor and fan in self.fan_floor:
-                    getattr(self.fans, "clear_floor", lambda f: None)(fan)
-                    self.fan_floor.pop(fan, None)
-                    self._save_floors()
+                pct, pin = target, want_floor
+                b = (self.boost or {}).get("levels", {}).get(fan)
+                if b is not None and b > pct:     # watchdog's first step: +15%, pinned
+                    pct, pin = b, True
+                self._drive(fan, pct, pin)
             self.applied[pid] = target
             if prev is None or target != prev:
                 self.temps_seen[pid] = temp
@@ -798,12 +857,64 @@ class CurveEngine:
                                 f"Worth checking for dust, a weak fan or blocked airflow.")
         return {"expect": round(expect, 1), "bias": round(self.bias.get(pid, 0.0), 2)}
 
+    def _start_boost(self, culprit, margin: float, over: List[str]) -> None:
+        name, val, kind, limit = culprit
+        clamp = getattr(self.fans, "_clamp", lambda p: int(p))
+        levels = {}
+        for f in sorted(set(self.fan_actual) | set(self.fan_applied)):
+            now = max(float(self.fan_actual.get(f) or 0), float(self.fan_applied.get(f) or 0))
+            levels[f] = clamp(min(100, now + BOOST_PCT))
+        self.boost = {"since": time.time(), "levels": levels,
+                      "reason": f"{name} reached {val}°C (trip point {limit - margin:g}°C)"}
+        if self.learning:
+            self.learning.clear()
+            self.log("tune", "Learning stopped: the watchdog stepped in.")
+        if self.mapping is not None:
+            self.mapping = None
+            self._save_mapping()
+            self.log("tune", "Fan map stopped: the watchdog stepped in.")
+        self.reset_applied()
+        others = [o for o in over if not o.startswith(f"{name} ")]
+        self.log("watchdog", f"Watchdog: {self.boost['reason']} — every fan +{BOOST_PCT}% "
+                             f"({', '.join(f'{f + 1}: {v}%' for f, v in levels.items())})."
+                             + (f" Also over: {', '.join(others)}." if others else "")
+                             + f" Fans go back to iLO only if it reaches {limit - margin + BOOST_HANDBACK_C:g}°C.")
+
+    def _drive(self, fan: int, pct: int, pin: bool) -> None:
+        """Put one fan at `pct`: always as its ceiling, and also as its floor when
+        pinned (so iLO can't run it slower). The floor is never left above the
+        ceiling: going down, the floor moves first."""
+        floor_now = self.fan_floor.get(fan)
+        def ceiling() -> None:
+            if self.fan_applied.get(fan) != pct:
+                self.fans.set_pwm(fan, pct, "max", remember=False)
+                self.fan_applied[fan] = pct
+        if pin:
+            down = floor_now is not None and pct < floor_now
+            if not down:
+                ceiling()
+            if self.floor_sent.get(fan) != pct or floor_now != pct:
+                self.fans.set_pwm(fan, pct, "min", remember=False)
+                self.fan_floor[fan] = self.floor_sent[fan] = pct
+                if floor_now != pct:
+                    self._save_floors()
+            if down:
+                ceiling()
+        else:
+            if floor_now is not None:
+                getattr(self.fans, "clear_floor", lambda f: None)(fan)
+                self.fan_floor.pop(fan, None)
+                self.floor_sent.pop(fan, None)
+                self._save_floors()
+            ceiling()
+
     def _clear_floors(self) -> None:
         for fan in list(self.fan_floor):
             try:
                 getattr(self.fans, "clear_floor", lambda f: None)(fan)
             except Exception:             # noqa: BLE001 - the next successful poll retries
                 return
+            self.floor_sent.pop(fan, None)
             self.fan_floor.pop(fan, None)
         self._save_floors()
 
@@ -831,6 +942,8 @@ class CurveEngine:
             "models": self.models,
             "mapping": self._mapping_status(),
             "fanmap": self.fanmap,
+            "boost": ({"since": self.boost["since"], "reason": self.boost["reason"],
+                       "levels": {str(f): v for f, v in self.boost["levels"].items()}} if self.boost else None),
         }
 
     def _mapping_status(self) -> Optional[Dict[str, Any]]:
@@ -842,5 +955,5 @@ class CurveEngine:
         held = self.clock() - run["step_started"]
         return {"step": run["i"] + 1, "of": len(run["plan"]), "fan": run["plan"][run["i"]],
                 "base": {str(f): v for f, v in run["base"].items()}, "bump_pct": FM.BUMP_PCT,
-                "left_s": int(max(0, FM.STEP_MIN_S - held) + FM.STEP_MIN_S * left),
+                "left_s": int(max(0, FM.STEP_FIT_MIN_S - held) + FM.STEP_FIT_MIN_S * left),
                 "max_left_s": int(max(0, FM.STEP_MAX_S - held) + FM.STEP_MAX_S * left)}

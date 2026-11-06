@@ -20,17 +20,69 @@ knows when other fans are helping), and - carefully - a better grouping.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import math
+from typing import Any, Dict, List, Optional, Tuple
 
 BUMP_PCT = 20               # how much one fan goes up for its step
-STEP_MIN_S = 600            # each step: at least this long ...
-STEP_SETTLED_S = 480        # ... then done once every temperature held within 1°C this long
-STEP_MAX_S = 1500           # ... or after this, settled or not
-MEASURE_S = 240             # a step's reading = the average over its last 4 minutes
+STEP_FIT_MIN_S = 300        # each step: at least this long, then done as soon as every
+                            # sensor's settling curve is known well enough to extrapolate
+STEP_MIN_S = 600            # (fallback) or once every temperature held within 1°C ...
+STEP_SETTLED_S = 480        # ... this long
+STEP_MAX_S = 1500           # ... or after this, whatever happened
+MEASURE_S = 240             # without a usable fit: the average over the last 4 minutes
+QUIET_C = 0.5               # a sensor that moved less than this in a step has nothing to wait for
 GUARD_BELOW_TRIP = 5        # abort when anything gets this close to its watchdog trip
 MIN_EFFECT_C = 0.6          # a +20% step must change a sensor at least this much to count
 DRIVES_PCT = 8              # a fan whose real speed rose this much follows that PWM channel
 MIN_SHARE = 0.15            # a curve whose own fans give < 15% of its cooling can't steer it
+
+
+def settle_fit(series: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
+    """Fit T(t) = end + amp * exp(-t / tau) to one sensor's readings in a step.
+
+    A heatsink after a change in airflow follows this closely, so after about
+    one time constant the end value can be worked out instead of waited for
+    (that wait was 10-25 minutes a step). Grid over tau, least squares for
+    end and amp. Returns end, amp, tau and the rms misfit."""
+    if len(series) < 8:
+        return None
+    t0 = series[0][0]
+    ts = [t - t0 for t, _ in series]
+    vs = [v for _, v in series]
+    n = len(vs)
+    best = None
+    tau = 30.0
+    while tau <= 2400:
+        x = [math.exp(-t / tau) for t in ts]
+        sx, sv = sum(x), sum(vs)
+        sxx = sum(a * a for a in x); sxv = sum(a * b for a, b in zip(x, vs))
+        det = n * sxx - sx * sx
+        if det > 1e-9:
+            amp = (n * sxv - sx * sv) / det
+            end = (sv - amp * sx) / n
+            rms = math.sqrt(sum((v - end - amp * a) ** 2 for v, a in zip(vs, x)) / n)
+            if best is None or rms < best["rms"]:
+                best = {"end": end, "amp": amp, "tau": tau, "rms": rms}
+        tau *= 1.15
+    return best
+
+
+def step_reading(series: List[Tuple[float, float]], held: float) -> Tuple[Optional[float], bool]:
+    """(the temperature this step settles at, whether that's known yet)."""
+    vals = [v for _, v in series]
+    if not vals:
+        return None, True
+    if max(vals) - min(vals) < QUIET_C:
+        return sum(vals) / len(vals), True
+    f = settle_fit(series)
+    if f and f["rms"] <= 0.7 and f["tau"] < STEP_MAX_S:
+        # Extrapolate only a short way: the change still to come must be small, so
+        # an uncertain time constant (whole-degree readings) can't move the answer much.
+        left = abs(f["amp"]) * math.exp(-held / f["tau"])
+        if left <= 0.5 or (held >= 0.6 * f["tau"] and left <= 1.0):
+            return f["end"], True
+    recent = [v for t, v in series if t >= series[-1][0] - min(MEASURE_S, held / 3)]
+    return sum(recent) / len(recent), False
 
 
 def plan(fan_count: int) -> List[Optional[int]]:

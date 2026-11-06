@@ -280,6 +280,11 @@ function renderBanner() {
   const live = c?.profile_state || {};
   const managed = Object.entries(ceilings()).filter(([, v]) => v < 100);
   if (!c) { kind = ""; title = "No data yet"; note = ""; }
+  else if (c.boost) {
+    kind = "tripped"; title = "Watchdog: every fan +15%";
+    note = `${c.boost.reason} — ${timeAgo(c.boost.since)}. The fans got 15% on top of their real speed; ` +
+      `they go back to iLO only if it climbs 2° past the trip point, and back to normal once it is 3° under it.`;
+  }
   else if (c.tripped_at) {
     kind = "tripped"; title = "Watchdog handed the fans back to iLO";
     note = `${c.trip_reason || ""} — ${timeAgo(c.tripped_at)}. ` +
@@ -1599,7 +1604,7 @@ function renderFanmap() {
     st.innerHTML = `Measured ${timeAgo(fm.finished_at)}. Each cell: how many °C that fan takes off that sensor per +10% speed. ` +
       `Blank means no measurable effect. The curves' models now count help from every fan.`;
   else
-    st.textContent = "Not measured yet. One run takes about 1.5–4 hours: each fan in turn goes 20% faster until the " +
+    st.textContent = "Not measured yet. One run takes about 45–100 minutes: each fan in turn goes 20% faster until the " +
       "temperatures settle (nothing runs hotter than it does now). Best done when the noise won't bother anyone.";
   const key = fm ? `${state.current}:${fm.finished_at}` : null;
   if (key !== fanmapKey) {
@@ -1666,7 +1671,7 @@ $("#fanmapBtn").onclick = guard(async () => {
     return toast("Fan map stopped — normal control resumed", "good");
   }
   if (!confirm("Map which fan cools what?\n\nEvery fan is held at its current speed, then one at a time goes 20% faster " +
-               "until the temperatures settle (10–25 minutes each, 1.5–4 hours in all). The curves are paused meanwhile, " +
+               "until the panel can tell where the temperatures will settle (5–10 minutes each, 45–100 minutes in all). The curves are paused meanwhile, " +
                "and it stops at once if anything gets near its limit. It will be a bit louder while it runs.")) return;
   const r = await sapi("/fanmap", { method:"POST", body:{} });
   toast(`Fan map started: ${r.steps} steps`, "good");
