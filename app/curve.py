@@ -441,13 +441,26 @@ class CurveEngine:
         run = self.mapping
         now = self.clock()
         margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
+        # Each sensor's limit for the run: GUARD_BELOW_TRIP under its watchdog trip -
+        # or, for one that already sits that close (a DL360 "HD Cntlr Zone" lives at
+        # 55° with its trip at 60), 2° over where it started, still under the trip.
+        # The run only ever adds airflow, so nothing should get hotter than at the start.
+        start = run.setdefault("start_temps", {t.get("name"): t.get("reading") for t in temps
+                                               if isinstance(t.get("reading"), (int, float))})
         for t in temps:
             v, lim = t.get("reading"), t.get("caution") or t.get("critical")
-            if isinstance(v, (int, float)) and isinstance(lim, (int, float)) and lim and v >= lim - margin - FM.GUARD_BELOW_TRIP:
+            if not (isinstance(v, (int, float)) and isinstance(lim, (int, float)) and lim):
+                continue
+            trip = lim - margin
+            guard = trip - FM.GUARD_BELOW_TRIP
+            s0 = start.get(t.get("name"))
+            if isinstance(s0, (int, float)) and s0 + 2 > guard:
+                guard = min(trip - 1, s0 + 2)
+            if v >= guard:
                 self.mapping = None
                 self.reset_applied()
                 self.log("tune", f"Fan map stopped early: {t.get('name')} reached {v:g}°C (the run's limit is "
-                                 f"{lim - margin - FM.GUARD_BELOW_TRIP:g}°C). Normal control resumed.")
+                                 f"{guard:g}°C). Normal control resumed.")
                 self.profile_state = {}
                 return
         k = run["plan"][run["i"]]
