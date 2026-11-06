@@ -398,7 +398,40 @@ def curve_suggest(sid: str, profile: str, days: int = Query(30, ge=1, le=30),
     if target is None and (prof.get("mode") == "target" or prof.get("target_set")):
         target = prof["target_c"]
     return suggest(sid, inp["sensors"], inp["fans"], prof["name"], target, inp["limit"],
-                   inp["margin"], inp["floor"], days, current=prof["points"])
+                   inp["margin"], inp["floor"], days, current=prof["points"],
+                   airflow=inp.get("airflow"))
+
+
+@app.post("/api/servers/{sid}/fanmap", dependencies=guard)
+def fanmap_start(sid: str) -> Dict[str, Any]:
+    """Measure which fan cools which sensor: hold all fans, raise one at a time."""
+    w = worker(sid)
+    run = w.curve.start_mapping(w.fan_count())
+    w.apply_now()
+    return {"ok": True, "steps": len(run["plan"])}
+
+
+@app.delete("/api/servers/{sid}/fanmap", dependencies=guard)
+def fanmap_stop(sid: str) -> Dict[str, Any]:
+    w = worker(sid)
+    w.curve.stop_mapping()
+    w.apply_now()
+    return {"ok": True}
+
+
+@app.get("/api/servers/{sid}/fanmap", dependencies=guard)
+def fanmap_get(sid: str) -> Dict[str, Any]:
+    """The last fan map, plus fan moves between curves it clearly supports."""
+    from .curve import hot_sensor
+    from .fanmap import suggest_assign
+    w = worker(sid)
+    fmap = w.curve.fanmap
+    if not fmap:
+        return {"map": None, "moves": []}
+    cfg = w.curve.config(w.fan_count())
+    temps = (w.thermal or {}).get("temperatures", [])
+    profs = [{"id": p["id"], "name": p["name"], "sensor": hot_sensor(temps, p["sensor"])[0]} for p in cfg["profiles"]]
+    return {"map": fmap, "profiles": profs, "moves": suggest_assign(fmap, profs, cfg["assign"])}
 
 
 @app.post("/api/servers/{sid}/curve/relearn", dependencies=guard)

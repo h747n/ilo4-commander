@@ -123,9 +123,37 @@ def _fan_levels(fans: List[float]) -> List[float]:
 # ---------------------------------------------------------------------- #
 # Data
 # ---------------------------------------------------------------------- #
+def _effective_fans(server: str, airflow: Dict[str, Any], since: int, until: int,
+                    points: int) -> Dict[int, Tuple[float, float, float, float]]:
+    """Effective airflow per bucket, from a fan map: (sum of w*speed over every fan
+    that cools this part, lo, hi, the part of it from other curves' fans)."""
+    own = {str(f) for f in airflow["own"]}
+    series = {}
+    for k, w in airflow["w"].items():
+        name = airflow["names"].get(str(k))
+        got = history_db.query(server, "fan", name, since, until, points) if name and w > 0 else []
+        if not got:
+            return {}                    # a fan without history: can't weigh it in
+        series[k] = {p["ts"]: (p["avg"], p["min"], p["max"]) for p in got}
+    if not series:
+        return {}
+    out = {}
+    for ts in set.intersection(*(set(s) for s in series.values())):
+        eff = sum(airflow["w"][k] * series[k][ts][0] for k in series)
+        swing = sum(airflow["w"][k] * (series[k][ts][2] - series[k][ts][1]) for k in series)
+        oth = sum(airflow["w"][k] * series[k][ts][0] for k in series if k not in own)
+        out[ts] = (eff, eff - swing / 2, eff + swing / 2, oth)
+    return out
+
+
 def collect(server: str, sensors: List[str], fan_names: List[str], profile_name: str,
-            days: int = 30) -> Dict[str, Any]:
-    """Steady periods as rows: ts, temp, rise over inlet, fan %, power, inlet."""
+            days: int = 30, airflow: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Steady periods as rows: ts, temp, rise over inlet, fan %, power, inlet.
+
+    With `airflow` (from a fan map: {"names": {idx: fan name}, "w": {idx: weight},
+    "own": [this curve's fan idx]}) "fan" is the effective airflow - every fan
+    weighted by how much it cools this part - and "oth" the share of it from
+    fans this curve doesn't drive."""
     now = int(time.time())
     # A few minutes inside the window, so it never lands right on the raw-retention
     # edge and flips between storage tiers from one second to the next.
@@ -135,8 +163,11 @@ def collect(server: str, sensors: List[str], fan_names: List[str], profile_name:
     inlet_name = pick_inlet(history_db.names(server).get("temp", []))
     inlet = _buckets(server, "temp", [inlet_name] if inlet_name else [], since, now, pts)
     power = _buckets(server, "power", ["system"], since, now, pts)
-    actual = _driven_fans(server, fan_names, since, now, pts)
-    ceiling = _buckets(server, "target", [profile_name], since, now, pts)
+    actual = _effective_fans(server, airflow, since, now, pts) if airflow else {}
+    if not actual:
+        airflow = None
+        actual = _driven_fans(server, fan_names, since, now, pts)
+    ceiling = _buckets(server, "target", [profile_name], since, now, pts) if not airflow else {}
 
     rows, values = [], []
     for ts in sorted(temp):
@@ -150,14 +181,20 @@ def collect(server: str, sensors: List[str], fan_names: List[str], profile_name:
         rise = t - inlet[ts][0]
         if rise <= 0.5:
             continue
-        rows.append({"ts": ts, "t": t, "rise": rise, "fan": fan[0],
-                     "p": power.get(ts, (0.0, 0, 0))[0], "tin": inlet[ts][0]})
+        row = {"ts": ts, "t": t, "rise": rise, "fan": fan[0],
+               "p": power.get(ts, (0.0, 0, 0))[0], "tin": inlet[ts][0]}
+        if airflow:
+            row["oth"] = fan[3]
+        rows.append(row)
     stuck = None
     if values:
         top = max(set(values), key=values.count)
         if values.count(top) / len(values) >= STUCK_SHARE and _pct(values, .9) - _pct(values, .1) <= 2:
             stuck = top
-    return {"rows": rows, "stuck": stuck, "bucket_s": (now - since) / pts}
+    out = {"rows": rows, "stuck": stuck, "bucket_s": (now - since) / pts}
+    if airflow:
+        out["airflow"] = airflow
+    return out
 
 
 # ---------------------------------------------------------------------- #
@@ -263,15 +300,34 @@ def learn(data: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"The temperature doesn't follow fan speed and load closely enough to predict "
                          f"(it missed recent data by {tested:.1f}°C on average).", "kind": "bad"}
     P = [r["p"] for r in rows]; TIN = [r["tin"] for r in rows]
-    return {"a": round(m["a"], 3), "b": round(m["b"], 5), "c": round(m["c"], 2),
+    a, b, c = m["a"], m["b"], m["c"]
+    eff = None
+    seen = levels
+    af = data.get("airflow")
+    if af:
+        # Fitted on effective airflow; everything downstream (designer, adaptive,
+        # predictions) thinks in this curve's own fan speed, so convert, with the
+        # other fans at their typical contribution. The controller redoes this
+        # live with the other fans' real speeds (curve._with_live_airflow).
+        s = sum(af["w"].get(str(k), 0.0) for k in af["own"])
+        oth = _pct([r["oth"] for r in rows], .5)
+        eff = {"a": round(a, 3), "b": round(b, 5), "c": round(c, 2), "s": round(s, 4),
+               "w": af["w"], "own": [int(k) for k in af["own"]], "others_typical": round(oth, 2)}
+        sc = max(s, 0.05)
+        a, b, c = a / sc, b / sc, (c + oth) / sc
+        seen = _fan_levels([(r["fan"] - r["oth"]) / sc for r in rows]) or levels
+    out = {"a": round(a, 3), "b": round(b, 5), "c": round(c, 2),
             "error_c": round(m["mae"], 2), "tested_c": round(tested, 2),
             "quality": "good" if tested <= GOOD_C else "rough",
             "n": len(rows), "hours": round(len(rows) * data["bucket_s"] / 3600, 1),
-            "fan_seen": [round(levels[0]), round(levels[-1])],
+            "fan_seen": [round(seen[0]), round(seen[-1])],
             "power": [round(_pct(P, .05)), round(_pct(P, .5)), round(max(P))],
             "inlet": [round(_pct(TIN, .05), 1), round(_pct(TIN, .5), 1), round(max(TIN), 1)],
             "temp_seen": [round(min(r["t"] for r in rows)), round(max(r["t"] for r in rows))],
             "fitted_at": int(time.time())}
+    if eff:
+        out["eff"] = eff
+    return out
 
 
 # ---------------------------------------------------------------------- #
@@ -372,8 +428,9 @@ def design(m: Dict[str, Any], target: Optional[float], limit: Optional[float], m
 
 def suggest(server: str, sensors: List[str], fan_names: List[str], profile_name: str,
             target: Optional[float], limit: Optional[float], margin: float,
-            min_floor: int = 0, days: int = 30, current: Optional[List[List[float]]] = None) -> Dict[str, Any]:
-    data = collect(server, sensors, fan_names, profile_name, days)
+            min_floor: int = 0, days: int = 30, current: Optional[List[List[float]]] = None,
+            airflow: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = collect(server, sensors, fan_names, profile_name, days, airflow)
     rows = data["rows"]
     out: Dict[str, Any] = {"pairs": len(rows), "hours": round(len(rows) * data["bucket_s"] / 3600, 1),
                            "samples": [{"t": round(r["t"], 1), "p": round(r["fan"], 1)}

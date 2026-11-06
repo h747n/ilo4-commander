@@ -147,7 +147,15 @@ class ServerWorker(threading.Thread):
         fans_live = (self.thermal or {}).get("fans", [])
         temps = (self.thermal or {}).get("temperatures", [])
         name, _ = hot_sensor(temps, sel)
-        return {"prof": prof, "sensors": sensors,
+        # With a fan map, the model weighs every fan by how much it cools this
+        # sensor, instead of assuming only the curve's own fans matter.
+        from .fanmap import weights
+        airflow = None
+        w = weights(self.curve.fanmap, name)
+        if w and all(int(k) < len(fans_live) for k in w):
+            airflow = {"names": {str(i): f["name"] for i, f in enumerate(fans_live)}, "w": w,
+                       "own": [int(i) for i, p in cfg["assign"].items() if p == pid]}
+        return {"prof": prof, "sensors": sensors, "airflow": airflow,
                 "fans": [fans_live[int(i)]["name"] for i, p in cfg["assign"].items()
                          if p == pid and int(i) < len(fans_live)],
                 "limit": sensor_limit(temps, name),

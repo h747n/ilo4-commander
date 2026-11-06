@@ -54,6 +54,7 @@ ADAPT_DOWN_STEP = 1.0       # % per step down
 ADAPT_TREND_S = 120         # history used to judge whether it's rising or falling
 ADAPT_FALLING = -0.3        # °C/min: already cooling, the last increase is working
 ADAPT_PANIC_C = 8           # this far over target: 100% at once
+ADAPT_LEAD_PCT = 20         # output may run at most this far ahead of the fans' real speed
 
 # "Learn": hold a curve's fans at a few known speeds so the curve designer can
 # see how much airflow matters. Up first (only ever more cooling), then one
@@ -213,6 +214,11 @@ class CurveEngine:
         # Floors a Learn run has set, kept on disk: if the service stops mid-run,
         # the first poll after it starts again clears them.
         self.fan_floor: Dict[int, int] = {int(k): v for k, v in self.learned.read().get("_floors", {}).items()}
+        # Fan map (fanmap.py): which fan cools which sensor, measured by a run that
+        # raises one fan at a time. The run in progress, and the last result.
+        self.mapping: Optional[Dict[str, Any]] = None
+        self.fanmap_store = JsonStore(server_dir(sid) / "fanmap.json", {})
+        self.fanmap: Optional[Dict[str, Any]] = self.fanmap_store.read() or None
 
     # ------------------------------------------------------------------ #
     def config(self, fan_count: int) -> Dict[str, Any]:
@@ -228,6 +234,10 @@ class CurveEngine:
             if not clean["enabled"] or pid not in ids:
                 self.learning.pop(pid, None)
                 self.log("tune", "Learning stopped: the curve was switched off or removed.")
+        if self.mapping is not None and not clean["enabled"]:
+            self.mapping = None
+            self._clear_floors()        # no curve step will run to clear them
+            self.log("tune", "Fan map stopped: the curve was switched off.")
         return clean
 
     def reset_applied(self) -> None:
@@ -269,6 +279,10 @@ class CurveEngine:
                 if self.learning:
                     self.learning.clear()
                     self.log("tune", "Learning stopped: the watchdog took over.")
+                if self.mapping is not None:
+                    self.mapping = None
+                    self._clear_floors()
+                    self.log("tune", "Fan map stopped: the watchdog took over.")
                 self.trip_reason = (f"{name} reached {val}°C — trip point {limit - margin:g}°C "
                                     f"({kind} {limit:g}°C minus {margin:g}°C margin)")
                 others = [o for o in over if not o.startswith(f"{name} ")]
@@ -276,6 +290,9 @@ class CurveEngine:
                 restore_err = ""
                 try:
                     self.fans.restore_auto()
+                    if self.fan_floor:            # restore_auto dropped them on the iLO too
+                        self.fan_floor.clear()
+                        self._save_floors()
                 except Exception as exc:      # noqa: BLE001
                     restore_err = f" Handing back FAILED: {exc}"
                 self.reset_applied()
@@ -308,6 +325,8 @@ class CurveEngine:
                 raise ValueError("No such curve.")
             if not cfg["enabled"] or self.tripped:
                 raise ValueError("Switch the automatic curve on first (and wait until the watchdog isn't active).")
+            if self.mapping is not None:
+                raise ValueError("A fan map is running; wait for it to finish.")
             base = self.applied.get(pid)
             if base is None:
                 raise ValueError("Let this curve run for a poll or two first.")
@@ -377,6 +396,119 @@ class CurveEngine:
             return None
         return run["levels"][run["i"]]
 
+    # ------------------------------------------------------------------ #
+    # Fan map: hold every fan, raise one at a time, see what cools down
+    # ------------------------------------------------------------------ #
+    def start_mapping(self, fan_count: int) -> Dict[str, Any]:
+        from . import fanmap as FM
+        with self._lock:
+            cfg = self.config(fan_count)
+            if not cfg["enabled"] or self.tripped:
+                raise ValueError("Switch the automatic curve on first (and wait until the watchdog isn't active).")
+            if self.learning:
+                raise ValueError("A Learn run is in progress; wait for it to finish.")
+            if self.mapping is not None:
+                raise ValueError("A fan map is already running.")
+            floor = int(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
+            base: Dict[int, int] = {}
+            for f in range(fan_count):
+                v = self.fan_actual.get(f)
+                if not isinstance(v, (int, float)):
+                    v = self.fan_applied.get(f)
+                if v is None:
+                    raise ValueError("Let the curve run for a poll or two first, so the fans' speeds are known.")
+                base[f] = max(floor, min(100 - FM.BUMP_PCT, int(round(v))))
+            now = self.clock()
+            self.mapping = {"plan": FM.plan(fan_count), "i": 0, "base": base, "step_started": now,
+                            "samples": [], "steps": [], "started": now}
+            n = len(self.mapping["plan"])
+            self.log("tune", f"Fan map started: every fan held where it is "
+                             f"({', '.join(f'{f + 1}: {v}%' for f, v in base.items())}), then one at a time "
+                             f"+{FM.BUMP_PCT}% until the temperatures settle - {n} steps, about "
+                             f"{n * FM.STEP_MIN_S // 60}-{n * FM.STEP_MAX_S // 60} min.")
+            return self.mapping
+
+    def stop_mapping(self, reason: str = "stopped by hand") -> None:
+        with self._lock:
+            if self.mapping is not None:
+                self.mapping = None
+                self.reset_applied()
+                self.log("tune", f"Fan map {reason}. Normal control resumed.")
+
+    def _map_step(self, temps: List[Dict[str, Any]]) -> None:
+        from . import fanmap as FM
+        from .tuner import pick_inlet
+        run = self.mapping
+        now = self.clock()
+        margin = float(getattr(self.fans, "cfg", {}).get("watchdog_margin_c", 5))
+        for t in temps:
+            v, lim = t.get("reading"), t.get("caution") or t.get("critical")
+            if isinstance(v, (int, float)) and isinstance(lim, (int, float)) and lim and v >= lim - margin - FM.GUARD_BELOW_TRIP:
+                self.mapping = None
+                self.reset_applied()
+                self.log("tune", f"Fan map stopped early: {t.get('name')} reached {v:g}°C (the run's limit is "
+                                 f"{lim - margin - FM.GUARD_BELOW_TRIP:g}°C). Normal control resumed.")
+                self.profile_state = {}
+                return
+        k = run["plan"][run["i"]]
+        levels = dict(run["base"])
+        if k is not None:
+            levels[k] = min(100, levels[k] + FM.BUMP_PCT)
+        clamp = getattr(self.fans, "_clamp", lambda p: int(p))
+        floors_changed = False
+        for fan, lvl in sorted(levels.items()):
+            lvl = clamp(lvl)
+            if self.fan_applied.get(fan) != lvl:     # ceiling first, so the floor is never above it
+                self.fans.set_pwm(fan, lvl, "max", remember=False)
+                self.fan_applied[fan] = lvl
+            if self.fan_floor.get(fan) != lvl:
+                self.fans.set_pwm(fan, lvl, "min", remember=False)
+                self.fan_floor[fan] = lvl
+                floors_changed = True
+        if floors_changed:
+            self._save_floors()
+        readings = {t["name"]: float(t["reading"]) for t in temps
+                    if isinstance(t.get("reading"), (int, float)) and t["reading"] > 0 and t.get("name")}
+        run["samples"].append((now, readings, {str(f): float(v) for f, v in self.fan_actual.items()}))
+        run["samples"] = [s for s in run["samples"] if now - s[0] <= FM.STEP_MAX_S]
+        inlet = pick_inlet(list(readings))
+        held = now - run["step_started"]
+        window = [s for s in run["samples"] if now - s[0] <= FM.STEP_SETTLED_S]
+        settled = held >= FM.STEP_MIN_S and now - window[0][0] >= FM.STEP_SETTLED_S - 15
+        if settled:
+            for n in readings:
+                if n == inlet:
+                    continue
+                vals = [s[1][n] for s in window if n in s[1]]
+                if vals and max(vals) - min(vals) > 1.0:
+                    settled = False
+                    break
+        if settled or held >= FM.STEP_MAX_S:
+            last = [s for s in run["samples"] if now - s[0] <= FM.MEASURE_S]
+            avg = lambda idx: {n: sum(s[idx][n] for s in last if n in s[idx]) / sum(1 for s in last if n in s[idx])
+                               for n in {n for s in last for n in s[idx]}}
+            run["steps"].append({"fan": k, "t": sum(s[0] for s in last) / len(last),
+                                 "temps": avg(1), "fans": avg(2)})
+            run["i"] += 1
+            run["step_started"] = now
+            run["samples"] = []
+            if run["i"] >= len(run["plan"]):
+                self._finish_mapping(FM.analyze(run["steps"], inlet))
+        self.profile_state = {}
+
+    def _finish_mapping(self, result: Dict[str, Any]) -> None:
+        result["base_pct"] = {str(f): v for f, v in self.mapping["base"].items()}
+        self.fanmap = result
+        self.fanmap_store.write(result)
+        self.mapping = None
+        self.reset_applied()
+        self.relearn_wanted = True
+        mins = (result["finished_at"] - result["started_at"]) // 60
+        odd = [f"PWM {int(k) + 1} moved fan(s) {', '.join(str(x + 1) for x in v) or 'none'}"
+               for k, v in result["drives"].items() if v != [int(k)]]
+        self.log("tune", f"Fan map finished after {mins} min — see the Fans tab for which fan cools what."
+                         + (f" Note: {'; '.join(odd)}." if odd else ""))
+
     def clear_trip(self) -> None:
         if self.tripped:
             self.tripped_at = self.trip_reason = None
@@ -394,6 +526,9 @@ class CurveEngine:
         self.last_run = time.time()
         if not cfg["enabled"] or self.tripped:
             self.profile_state = {}
+            return
+        if self.mapping is not None:
+            self._map_step(temps)
             return
 
         by_profile: Dict[str, List[int]] = {}
@@ -421,7 +556,9 @@ class CurveEngine:
             obs = self._observe(pid, prof, temp, fan_list)
             f_pred = None
             m = self.usable_model(pid)
-            if prof.get("mode") == "target" and m and m.get("quality") == "good":
+            from .fanmap import MIN_SHARE
+            steerable = not (m or {}).get("eff") or m["eff"]["s"] >= MIN_SHARE
+            if prof.get("mode") == "target" and m and m.get("quality") == "good" and steerable:
                 from .tuner import needed_fan
                 # Aim a little under the target so the feedback loop has room.
                 f_pred = needed_fan(m, self.live.get("power", 0.0), self.live["inlet"],
@@ -435,7 +572,9 @@ class CurveEngine:
                 hot_room = {"inlet": round(warm, 1), "fan": round(min(need, 999.0), 1)}
             if prof.get("mode") == "target":
                 if learn is None:
-                    target = self._adaptive(pid, prof, temp, goal, hyst, up, f_pred)
+                    real = [self.fan_actual[f] for f in fan_list if isinstance(self.fan_actual.get(f), (int, float))]
+                    target = self._adaptive(pid, prof, temp, goal, hyst, up, f_pred,
+                                            actual=(sum(real) / len(real)) if real else None)
                 else:   # hold what it had learned while the test runs
                     target = int(round(self.adapt.get(pid, {}).get("out", learn)))
             else:
@@ -457,7 +596,11 @@ class CurveEngine:
             # A ceiling only stops iLO going faster; on these iLOs it often runs well
             # below it. A Learn step that adds airflow therefore also sets a floor,
             # so the fans really turn at that speed; the floor goes once it's over.
-            want_floor = learn is not None and learn >= self.learning[pid]["base"]
+            # Adaptive mode pins its fans the same way: with only a ceiling, raising
+            # it changed nothing while iLO kept the fan at 20%, and the output wound
+            # up to 100% overnight (DL380p HD controller) with no control at all.
+            want_floor = ((learn is not None and learn >= self.learning[pid]["base"])
+                          or (learn is None and prof.get("mode") == "target"))
             for fan in sorted(fan_list):
                 if self.fan_applied.get(fan) != target:
                     self.fans.set_pwm(fan, target, "max", remember=False)
@@ -493,7 +636,8 @@ class CurveEngine:
         self.last_error = None
 
     def _adaptive(self, pid: str, prof: Dict[str, Any], temp: float, goal: float,
-                  hyst: float, up: int, f_pred: Optional[float] = None) -> int:
+                  hyst: float, up: int, f_pred: Optional[float] = None,
+                  actual: Optional[float] = None) -> int:
         """Find the lowest fan speed that holds `temp` at or under `goal`.
 
         With a good learned model (`f_pred`: the speed it predicts is needed right
@@ -512,6 +656,10 @@ class CurveEngine:
             saved = self.learned.read().get(pid)
             start = (float(saved) if isinstance(saved, (int, float))
                      else f_pred if f_pred is not None else float(interpolate(prof["points"], temp)))
+            if actual is not None:
+                # Never start above what the fans really do now: the output is
+                # pinned (a floor too), and a saved ceiling iLO ignored would jolt them.
+                start = min(start, actual)
             a = self.adapt[pid] = {"out": start, "hist": [], "last_up": 0.0, "last_down": now}
         a["hist"] = [(t, v) for t, v in a["hist"] if now - t <= ADAPT_TREND_S] + [(now, temp)]
         first_t, first_v = a["hist"][0]
@@ -546,6 +694,10 @@ class CurveEngine:
                 a["out"] -= step
                 a["last_down"] = now
         floor = float(getattr(self.fans, "cfg", {}).get("min_pwm_percent", 0))
+        if actual is not None and err < ADAPT_PANIC_C and a["out"] > actual + ADAPT_LEAD_PCT:
+            # Never run far ahead of what the fans really do (anti wind-up): if they
+            # don't follow, more output only stores up a jolt for later.
+            a["out"] = max(actual + ADAPT_LEAD_PCT, floor)
         a["out"] = max(floor, min(100.0, a["out"]))
         result = int(round(a["out"]))
         if a.get("saved") != result:    # remember it across restarts (changes are rare)
@@ -564,18 +716,57 @@ class CurveEngine:
 
     def usable_model(self, pid: str) -> Optional[Dict[str, Any]]:
         m = self.models.get(pid)
-        return m if m and not m.get("error") and "inlet" in self.live else None
+        if not m or m.get("error") or "inlet" not in self.live:
+            return None
+        return self._with_live_airflow(m)
+
+    def _with_live_airflow(self, m: Dict[str, Any]) -> Dict[str, Any]:
+        """A model fitted on effective airflow (all fans, weighted by the fan map) in
+        terms of this curve's own fans, with the other fans at their speed right now:
+        rise = (a + bP) / (s*own + others + c)  =  (a/s + b/s*P) / (own + (others + c)/s)."""
+        e = m.get("eff")
+        if not e:
+            return m
+        own = {str(f) for f in e["own"]}
+        others = 0.0
+        for k, w in e["w"].items():
+            if k in own:
+                continue
+            v = self.fan_actual.get(int(k))
+            if not isinstance(v, (int, float)):
+                v = self.fan_applied.get(int(k))
+            if v is None:
+                return m                    # stored conversion (typical other fans) then
+            others += w * float(v)
+        s = max(e["s"], 0.05)
+        return dict(m, a=e["a"] / s, b=e["b"] / s, c=(e["c"] + others) / s)
+
+    def own_speed(self, m: Dict[str, Any], fans: List[int]) -> Optional[float]:
+        """This curve's fan speed as the model counts it (weighted when it has a fan map)."""
+        e = m.get("eff")
+        if e and e["s"] > 0:
+            num = 0.0
+            for k in e["own"]:
+                w = e["w"].get(str(k), 0.0)
+                v = self.fan_actual.get(int(k))
+                if w and not isinstance(v, (int, float)):
+                    break
+                num += w * (v or 0.0)
+            else:
+                return num / e["s"]
+        real = [self.fan_actual[f] for f in fans if isinstance(self.fan_actual.get(f), (int, float))]
+        return sum(real) / len(real) if real else None
 
     def _observe(self, pid: str, prof: Dict[str, Any], temp: float, fans: List[int]) -> Optional[Dict[str, Any]]:
         """Compare reality with the model: keep its live bias up to date, and flag a
         part that runs much hotter than it should for this load and airflow."""
         m = self.usable_model(pid)
-        real = [self.fan_actual[f] for f in fans if isinstance(self.fan_actual.get(f), (int, float))]
-        if not m or not real:
+        speed = self.own_speed(m, fans) if m else None
+        if not m or speed is None:
             return None
         from .tuner import predict_temp
         now = self.clock()
-        expect = predict_temp(m, self.live.get("power", 0.0), self.live["inlet"], sum(real) / len(real))
+        expect = predict_temp(m, self.live.get("power", 0.0), self.live["inlet"], speed)
         miss = temp - expect
         hist = [x for x in self.track.get(pid, []) if now - x[0] <= 600] + [(now, temp, miss)]
         self.track[pid] = hist
@@ -593,6 +784,15 @@ class CurveEngine:
                                 f"room temperature and fan speed (expected ~{expect:.0f}°C, seeing {temp:g}°C). "
                                 f"Worth checking for dust, a weak fan or blocked airflow.")
         return {"expect": round(expect, 1), "bias": round(self.bias.get(pid, 0.0), 2)}
+
+    def _clear_floors(self) -> None:
+        for fan in list(self.fan_floor):
+            try:
+                getattr(self.fans, "clear_floor", lambda f: None)(fan)
+            except Exception:             # noqa: BLE001 - the next successful poll retries
+                return
+            self.fan_floor.pop(fan, None)
+        self._save_floors()
 
     def _save_floors(self) -> None:
         data = self.learned.read()
@@ -616,4 +816,18 @@ class CurveEngine:
             "tripped_at": self.tripped_at,
             "trip_reason": self.trip_reason,
             "models": self.models,
+            "mapping": self._mapping_status(),
+            "fanmap": self.fanmap,
         }
+
+    def _mapping_status(self) -> Optional[Dict[str, Any]]:
+        from . import fanmap as FM
+        run = self.mapping
+        if run is None:
+            return None
+        left = len(run["plan"]) - run["i"] - 1
+        held = self.clock() - run["step_started"]
+        return {"step": run["i"] + 1, "of": len(run["plan"]), "fan": run["plan"][run["i"]],
+                "base": {str(f): v for f, v in run["base"].items()}, "bump_pct": FM.BUMP_PCT,
+                "left_s": int(max(0, FM.STEP_MIN_S - held) + FM.STEP_MIN_S * left),
+                "max_left_s": int(max(0, FM.STEP_MAX_S - held) + FM.STEP_MAX_S * left)}

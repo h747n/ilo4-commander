@@ -922,6 +922,9 @@ function showCurveLive() {
   const box = $("#curveLive"), live = selectedSensor(), st = c.profile_state?.[prof.id];
   const n = fansOf(prof.id).length, fanWord = `${n} fan${n === 1 ? "" : "s"}`, dot = profColor(prof.id);
   if (c.tripped_at) box.innerHTML = `<span class="live-dot"></span>Paused by the watchdog — ${esc(c.trip_reason || "")}`;
+  else if (c.mapping)
+    box.innerHTML = `<span class="live-dot" style="background:var(--uid);box-shadow:0 0 8px var(--uid)"></span>` +
+      `Paused while the fan map runs (step ${c.mapping.step} of ${c.mapping.of}, ${learnLeft(c.mapping)} left) — see Fan map below.`;
   else if (st?.learning)
     box.innerHTML = `<span class="live-dot" style="background:var(--uid);box-shadow:0 0 8px var(--uid)"></span>
       Learning, step <b>${st.learning.step}</b> of ${st.learning.of}: ${fanWord} held at <b>${st.applied}%</b> —
@@ -1525,6 +1528,7 @@ function renderAll() {
         if (!curveDragging) updateCurve();
         updateProfileLive(); updateLearnButton();
       }
+      renderFanmap();
       if (!document.activeElement?.matches?.("#fanRows input")) renderFans();
     }
   });
@@ -1576,4 +1580,94 @@ document.addEventListener("DOMContentLoaded", async () => {
   const a = await fetch("/api/auth", { credentials:"same-origin" }).then(r => r.json()).catch(() => ({}));
   if (a.required && !a.signed_in) showGate();
   else { $("#app").hidden = false; boot().catch(e => toast(e.message, "bad")); }
+});
+
+/* ---- fan map: which fan really cools which part (app/fanmap.py) ---- */
+let fanmapKey = null;
+function renderFanmap() {
+  const c = curveStatus(); if (!c) return;
+  const run = c.mapping, fm = c.fanmap;
+  $("#fanmapBtn").textContent = run ? `Stop (${learnLeft(run)} left)` : fm ? "Map again" : "Map fans";
+  $("#fanmapBtn").classList.toggle("danger", !!run);
+  const st = $("#fanmapStatus");
+  if (run)
+    st.innerHTML = `Step <b>${run.step}</b> of ${run.of}: ` +
+      (run.fan == null ? `every fan held — measuring the ${run.step === 1 ? "starting" : "closing"} temperatures`
+                       : `fan <b>${run.fan + 1}</b> at +${run.bump_pct}%, the others held`) +
+      ` · ${learnLeft(run)} left. The curves are paused meanwhile; it stops at once if anything gets near its limit.`;
+  else if (fm)
+    st.innerHTML = `Measured ${timeAgo(fm.finished_at)}. Each cell: how many °C that fan takes off that sensor per +10% speed. ` +
+      `Blank means no measurable effect. The curves' models now count help from every fan.`;
+  else
+    st.textContent = "Not measured yet. One run takes about 1.5–4 hours: each fan in turn goes 20% faster until the " +
+      "temperatures settle (nothing runs hotter than it does now). Best done when the noise won't bother anyone.";
+  const key = fm ? `${state.current}:${fm.finished_at}` : null;
+  if (key !== fanmapKey) {
+    fanmapKey = key; state.fanmapExtra = null;
+    if (fm) sapi("/fanmap").then(r => { state.fanmapExtra = r; renderFanmapMoves(); }).catch(() => {});
+  }
+  drawFanmapTable(fm);
+  renderFanmapMoves();
+}
+function drawFanmapTable(fm) {
+  const box = $("#fanmapTable");
+  if (!fm) { box.innerHTML = ""; return; }
+  const followed = new Map(Object.values(curveStatus()?.profile_state || {}).map(p => [p.sensor, p.name]));
+  (state.fanmapExtra?.profiles || []).forEach(p => p.sensor && !followed.has(p.sensor) && followed.set(p.sensor, p.name));
+  const rows = Object.entries(fm.sensors).filter(([, s]) => Object.keys(s.per10).length)
+    .map(([n, s]) => [n, s, Math.max(...Object.values(s.per10).map(Math.abs))])
+    .sort((a, b) => (followed.has(b[0]) - followed.has(a[0])) || b[2] - a[2]).slice(0, 14);
+  const flat = Object.entries(fm.sensors).filter(([, s]) => s.flat).map(([n]) => n);
+  const top = Math.max(0.1, ...rows.map(r => r[2]));
+  const head = fm.fans.map(f => {
+    const d = fm.drives?.[String(f)] || [];
+    const odd = d.length && !(d.length === 1 && d[0] === f);
+    return `<th title="${odd ? `PWM channel ${f + 1} actually moved fan ${d.map(x => x + 1).join(", ")}` : `Fan ${f + 1}`}">F${f + 1}${odd ? `<small>→${d.map(x => x + 1).join(",")}</small>` : ""}</th>`;
+  }).join("");
+  const body = rows.map(([n, s]) => {
+    const tag = followed.get(n);
+    return `<tr${tag ? ' class="followed"' : ""}><td>${esc(n)}${tag ? `<small>${esc(tag)}</small>` : ""}</td>` +
+      fm.fans.map(f => {
+        const v = s.per10[String(f)];
+        if (v == null) return "<td></td>";
+        const a = Math.min(1, Math.abs(v) / top);
+        const bg = v > 0 ? `rgba(47,192,139,${0.12 + a * 0.5})` : `rgba(240,85,90,${0.12 + a * 0.4})`;
+        return `<td style="background:${bg}" title="${v > 0 ? "cools" : "warms"} ${esc(n)} by ${Math.abs(v)}°C per +10%">${v.toFixed(1)}</td>`;
+      }).join("") + "</tr>";
+  }).join("");
+  box.innerHTML = rows.length
+    ? `<table class="fanmap"><thead><tr><th>Sensor</th>${head}</tr></thead><tbody>${body}</tbody></table>` +
+      (flat.length ? `<p class="hint">Didn't change at all (probably reading a floor, like iLO's 40° for idle CPUs): ${flat.map(esc).join(", ")}.</p>` : "")
+    : `<p class="hint">No sensor changed measurably — the fans may already have plenty of headroom.</p>`;
+}
+function renderFanmapMoves() {
+  const box = $("#fanmapMoves"), moves = state.fanmapExtra?.moves || [];
+  box.hidden = !moves.length || !!curveStatus()?.mapping;
+  if (box.hidden) return;
+  const pname = id => profiles().find(p => p.id === id)?.name || id;
+  box.innerHTML = `<p><b>Suggested regrouping</b> — only where the measurement leaves no doubt:</p><ul>` +
+    moves.map(m => `<li>Move <b>fan ${m.fan + 1}</b> from “${esc(pname(m.from))}” to “${esc(pname(m.to))}”. <span>${esc(m.why)}</span></li>`).join("") +
+    `</ul><div class="row"><span class="spacer"></span><button class="primary" id="fanmapApply">Apply regrouping</button></div>`;
+  $("#fanmapApply").onclick = guard(async () => {
+    if (!confirm(`Move ${moves.map(m => `fan ${m.fan + 1}`).join(", ")} to the suggested curves?`)) return;
+    moves.forEach(m => { state.curveCfg.assign[String(m.fan)] = m.to; });
+    if (await saveCurve()) {
+      toast("Fans regrouped", "good");
+      state.fanmapExtra.moves = [];
+      renderAssignChips(); renderProfileBar(); renderFanmapMoves();
+      await sapi("/curve/relearn", { method:"POST" });
+    }
+  });
+}
+$("#fanmapBtn").onclick = guard(async () => {
+  if (curveStatus()?.mapping) {
+    if (!confirm("Stop the fan map? What was measured so far is discarded.")) return;
+    await sapi("/fanmap", { method:"DELETE" });
+    return toast("Fan map stopped — normal control resumed", "good");
+  }
+  if (!confirm("Map which fan cools what?\n\nEvery fan is held at its current speed, then one at a time goes 20% faster " +
+               "until the temperatures settle (10–25 minutes each, 1.5–4 hours in all). The curves are paused meanwhile, " +
+               "and it stops at once if anything gets near its limit. It will be a bit louder while it runs.")) return;
+  const r = await sapi("/fanmap", { method:"POST", body:{} });
+  toast(`Fan map started: ${r.steps} steps`, "good");
 });

@@ -52,7 +52,8 @@ class Learner(threading.Thread):
             inp = w.profile_inputs(prof["id"])
             if not inp or not inp["sensors"]:
                 continue
-            data = tuner.collect(w.sid, inp["sensors"], inp["fans"], prof["name"], HISTORY_DAYS)
+            data = tuner.collect(w.sid, inp["sensors"], inp["fans"], prof["name"], HISTORY_DAYS,
+                                 inp.get("airflow"))
             m = tuner.learn(data)
             if not m.get("error"):
                 # Quietest curve within the maximum the user set (or a sensible default).
