@@ -227,6 +227,7 @@ class CurveEngine:
         # (e.g. after an iLO reset, which drops them) sends them again.
         self.floor_sent: Dict[int, int] = {}
         self.boost: Optional[Dict[str, Any]] = None       # watchdog step one: +15% pinned on every fan
+        self._pending_log: Optional[str] = None
         self._resume_mapping()
 
     # ------------------------------------------------------------------ #
@@ -571,13 +572,14 @@ class CurveEngine:
             return
         if self.clock() - saved.get("saved_at", 0) > self.MAPPING_RESUME_MAX_S:
             self._save_mapping()                       # too old to carry on: drop it
-            self.log("tune", "A fan map was interrupted too long ago to carry on; start it again if needed.")
+            self._pending_log = "A fan map was interrupted too long ago to carry on; start it again if needed."
             return
         now = self.clock()
         self.mapping = {"plan": saved["plan"], "i": saved["i"], "steps": saved["steps"],
                         "started": saved["started"], "base": {int(f): v for f, v in saved["base"].items()},
                         "start_temps": saved.get("start_temps") or {}, "step_started": now, "samples": []}
-        self.log("tune", f"Fan map carried on after a restart, at step {saved['i'] + 1} of {len(saved['plan'])}.")
+        # Logged on the first poll: the worker that owns the log isn't fully built yet.
+        self._pending_log = f"Fan map carried on after a restart, at step {saved['i'] + 1} of {len(saved['plan'])}."
 
     def _finish_mapping(self, result: Dict[str, Any]) -> None:
         result["base_pct"] = {str(f): v for f, v in self.mapping["base"].items()}
@@ -605,6 +607,9 @@ class CurveEngine:
             self._step(temps, fan_count)
 
     def _step(self, temps: List[Dict[str, Any]], fan_count: int) -> None:
+        if self._pending_log:
+            self.log("tune", self._pending_log)
+            self._pending_log = None
         cfg = self.config(fan_count)
         self.last_run = time.time()
         if not cfg["enabled"] or self.tripped:
