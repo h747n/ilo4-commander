@@ -134,6 +134,7 @@ def analyze(steps: List[Dict[str, Any]], inlet: Optional[str] = None) -> Dict[st
                 hit.append(int(f))
         drives[str(s["fan"])] = sorted(hit)
     return {"bump_pct": BUMP_PCT, "sensors": sensors, "drives": drives,
+            "inlet_c": (round(b0["temps"][inlet], 1) if inlet and inlet in b0["temps"] else None),
             "fans": [s["fan"] for s in bumps],
             "started_at": int(b0["t"] - MEASURE_S / 2), "finished_at": int(b1["t"] + MEASURE_S / 2)}
 
@@ -150,6 +151,28 @@ def weights(fmap: Optional[Dict[str, Any]], sensor: Optional[str]) -> Optional[D
     if total < MIN_EFFECT_C * 10 / BUMP_PCT:
         return None
     return {k: round(v / total, 4) for k, v in pos.items()}
+
+
+def airflow_hint(fmap: Optional[Dict[str, Any]], sensor: Optional[str],
+                 w: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    """What the map says about this sensor's airflow constant c, for a model
+    rise = K / (F + c) with F the effective airflow:  d(rise)/dF = -rise / (F + c),
+    so the total drop per +10% across all fans gives F + c = rise * 10 / drop.
+    History that never varied the fans can't tell c; with this it doesn't have to."""
+    if not fmap or not sensor or not w:
+        return None
+    s = (fmap.get("sensors") or {}).get(sensor)
+    inlet = fmap.get("inlet_c")
+    base = fmap.get("base_pct") or {}
+    if not s or inlet is None or not all(k in base for k in w):
+        return None
+    drop = sum(v for v in s["per10"].values() if v > 0)
+    rise = s["temp"] - inlet
+    F = sum(wk * base[k] for k, wk in w.items())
+    if drop <= 0 or rise <= 1:
+        return None
+    c = rise * 10 / drop - F
+    return {"c": round(c, 2), "F": round(F, 2), "rise": round(rise, 2)} if c > 0.5 else None
 
 
 def suggest_assign(fmap: Dict[str, Any], profiles: List[Dict[str, Any]],

@@ -259,6 +259,46 @@ def needed_fan(m: Dict[str, float], power: float, inlet: float, temp: float, bia
     return (m["a"] + m["b"] * power) / room - m["c"] if room > 0.5 else 999.0
 
 
+def _fit_ab(rows: List[Dict[str, Any]], c: float) -> Optional[Tuple[float, float]]:
+    """With c known: rise * (F + c) = a + b * P is a straight line - least squares
+    for a and b (b >= 0), no variation in fan speed needed."""
+    y = [r["rise"] * (r["fan"] + c) for r in rows]
+    P = [r["p"] for r in rows]
+    n = len(rows)
+    mp, my = sum(P) / n, sum(y) / n
+    spp = sum((p - mp) ** 2 for p in P)
+    b = sum((p - mp) * (v - my) for p, v in zip(P, y)) / spp if spp > 1e-9 else 0.0
+    b = max(0.0, b)
+    a = my - b * mp
+    return (a, b) if a + b * mp > 0 else None
+
+
+def _learn_with_map_c(data: Dict[str, Any], rows: List[Dict[str, Any]], hint: Dict[str, float],
+                      levels: List[float]) -> Dict[str, Any]:
+    """The airflow constant from the fan map, the load part from history."""
+    c = hint["c"]
+    ab = _fit_ab(rows, c)
+    if not ab:
+        return {"error": "Couldn't fit a model to this data.", "kind": "bad"}
+    a, b = ab
+    err = lambda m, rs: sum(abs(r["rise"] - (m[0] + m[1] * r["p"]) / (r["fan"] + c)) for r in rs) / len(rs)
+    fitted = err(ab, rows)
+    tested = fitted
+    hold = [(r["ts"] // 3600) % 5 == 0 for r in rows]
+    tr = [r for r, h in zip(rows, hold) if not h]
+    te = [r for r, h in zip(rows, hold) if h]
+    if len(te) >= 5 and len(tr) >= MIN_ROWS:
+        ab_tr = _fit_ab(tr, c)
+        if ab_tr:
+            tested = err(ab_tr, te)
+    if tested > MAX_ERR_C:
+        return {"error": f"The temperature doesn't follow load closely enough to predict "
+                         f"(it missed recent data by {tested:.1f}°C on average).", "kind": "bad"}
+    m = _finish_model(data, rows, a, b, c, fitted, tested, levels)
+    m["source"] = "fan map + history"
+    return m
+
+
 def learn(data: Dict[str, Any]) -> Dict[str, Any]:
     """A model, or {"error": why not} - in plain words."""
     rows = data["rows"]
@@ -272,6 +312,9 @@ def learn(data: Dict[str, Any]) -> Dict[str, Any]:
                          f"temperature and fan speed both held still).", "kind": "short"}
     fans = [r["fan"] for r in rows]
     levels = _fan_levels(fans)
+    hint = (data.get("airflow") or {}).get("hint")
+    if (not levels or levels[-1] - levels[0] < MIN_FAN_SPREAD) and hint:
+        return _learn_with_map_c(data, rows, hint, levels or [min(fans), max(fans)])
     if not levels or levels[-1] - levels[0] < MIN_FAN_SPREAD:
         lo, hi = (levels[0], levels[-1]) if levels else (min(fans), max(fans))
         return {"error": f"The fan speed has hardly changed ({lo:.0f}–{hi:.0f}%), so "
@@ -299,8 +342,12 @@ def learn(data: Dict[str, Any]) -> Dict[str, Any]:
     if tested > MAX_ERR_C:
         return {"error": f"The temperature doesn't follow fan speed and load closely enough to predict "
                          f"(it missed recent data by {tested:.1f}°C on average).", "kind": "bad"}
+    return _finish_model(data, rows, m["a"], m["b"], m["c"], m["mae"], tested, levels)
+
+
+def _finish_model(data: Dict[str, Any], rows: List[Dict[str, Any]], a: float, b: float, c: float,
+                  fitted: float, tested: float, levels: List[float]) -> Dict[str, Any]:
     P = [r["p"] for r in rows]; TIN = [r["tin"] for r in rows]
-    a, b, c = m["a"], m["b"], m["c"]
     eff = None
     seen = levels
     af = data.get("airflow")
@@ -317,7 +364,7 @@ def learn(data: Dict[str, Any]) -> Dict[str, Any]:
         a, b, c = a / sc, b / sc, (c + oth) / sc
         seen = _fan_levels([(r["fan"] - r["oth"]) / sc for r in rows]) or levels
     out = {"a": round(a, 3), "b": round(b, 5), "c": round(c, 2),
-            "error_c": round(m["mae"], 2), "tested_c": round(tested, 2),
+            "error_c": round(fitted, 2), "tested_c": round(tested, 2),
             "quality": "good" if tested <= GOOD_C else "rough",
             "n": len(rows), "hours": round(len(rows) * data["bucket_s"] / 3600, 1),
             "fan_seen": [round(seen[0]), round(seen[-1])],

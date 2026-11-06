@@ -961,7 +961,7 @@ function renderModelLine(prof, st) {
     return;
   }
   const q = m.quality === "good" ? `<span class="ok">good</span>` : `<span class="warn">rough</span>`;
-  let html = `Model (${q}): predicts within <b>±${m.tested_c}°C</b> on recent data it hadn't seen · ` +
+  let html = `Model (${q}${m.source === "fan map + history" ? ", airflow from the fan map" : m.eff ? ", counts every fan" : ""}): predicts within <b>±${m.tested_c}°C</b> on recent data it hadn't seen · ` +
     `${m.hours} h of steady data, fans ${m.fan_seen[0]}–${m.fan_seen[1]}% · updated ${ago} · <a data-relearn>update now</a>`;
   if (st?.model) html += `<br>Right now it expects <b>${st.model.expect}°</b> (seeing ${Math.round(st.temp)}°, live correction ${st.model.bias >= 0 ? "+" : ""}${st.model.bias}°)` +
     (st.predicted_need != null ? ` — needs about <b>${Math.round(st.predicted_need)}%</b> to hold the target` : "");

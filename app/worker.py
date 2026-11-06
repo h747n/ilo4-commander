@@ -149,12 +149,21 @@ class ServerWorker(threading.Thread):
         name, _ = hot_sensor(temps, sel)
         # With a fan map, the model weighs every fan by how much it cools this
         # sensor, instead of assuming only the curve's own fans matter.
-        from .fanmap import weights
+        from .fanmap import weights, airflow_hint
+        from .tuner import pick_inlet
         airflow = None
-        w = weights(self.curve.fanmap, name)
+        fmap = self.curve.fanmap
+        w = weights(fmap, name)
         if w and all(int(k) < len(fans_live) for k in w):
             airflow = {"names": {str(i): f["name"] for i, f in enumerate(fans_live)}, "w": w,
                        "own": [int(i) for i, p in cfg["assign"].items() if p == pid]}
+            if fmap.get("inlet_c") is None:
+                # maps measured before 3.3.2 didn't keep the room temperature: look it up
+                inl = pick_inlet(known)
+                q = history_db.query(self.sid, "temp", inl, fmap["started_at"], fmap["started_at"] + 900, 3) if inl else []
+                if q:
+                    fmap = dict(fmap, inlet_c=round(q[0]["avg"], 1))
+            airflow["hint"] = airflow_hint(fmap, name, w)
         return {"prof": prof, "sensors": sensors, "airflow": airflow,
                 "fans": [fans_live[int(i)]["name"] for i, p in cfg["assign"].items()
                          if p == pid and int(i) < len(fans_live)],
